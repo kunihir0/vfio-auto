@@ -25,6 +25,11 @@ from pathlib import Path
 import argparse
 import json
 import datetime
+import time
+
+
+# Get the directory where the script is located
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class Colors:
@@ -61,6 +66,42 @@ def log_debug(message, debug=False):
     """Print a debug message if debug mode is enabled."""
     if debug:
         print(f"{Colors.BLUE}[DEBUG]{Colors.ENDC} {message}")
+
+
+def check_dependencies():
+    """Check if all required commands are available."""
+    log_info("Checking for required dependencies...")
+    
+    required_commands = [
+        "lspci", "grep", "awk", "find", "mkdir", "cp", "chmod",
+        "cat", "ls", "df", "test"
+    ]
+    
+    # Check for bootloader/initramfs update commands
+    # We don't require all of them, just the ones appropriate for the system
+    update_commands = {
+        "grub": ["update-grub", "grub-mkconfig", "grub2-mkconfig"],
+        "initramfs": ["update-initramfs", "dracut"]
+    }
+    
+    missing_commands = []
+    for cmd in required_commands:
+        if not shutil.which(cmd):
+            missing_commands.append(cmd)
+    
+    if missing_commands:
+        log_error(f"Missing required commands: {', '.join(missing_commands)}")
+        log_error("Please install these dependencies before running the script.")
+        return False
+    
+    # Check for at least one update command from each category
+    for category, cmds in update_commands.items():
+        if not any(shutil.which(cmd) for cmd in cmds):
+            log_warning(f"Missing {category} update command. The script may not work correctly.")
+            log_warning(f"Required at least one of: {', '.join(cmds)}")
+    
+    log_success("All required dependencies are available.")
+    return True
 
 
 def run_command(command, dry_run=False, debug=False):
@@ -225,14 +266,14 @@ def get_gpus():
 def find_gpu_for_passthrough(gpus):
     """Find the AMD GPU for passthrough."""
     amd_gpus = [gpu for gpu in gpus if gpu['vendor'] == 'AMD']
-    nvidia_gpus = [gpu for gpu in gpus if gpu['vendor'] == 'NVIDIA' and '1650' in gpu['description']]
+    nvidia_gpus = [gpu for gpu in gpus if gpu['vendor'] == 'NVIDIA']
     
     if not amd_gpus:
         log_error("No AMD GPUs found for passthrough.")
         return None
     
-    if not nvidia_gpus:
-        log_warning("NVIDIA GTX 1650 not found. Make sure you have a GPU for the host system.")
+    if not nvidia_gpus and not [gpu for gpu in gpus if gpu['vendor'] != 'AMD']:
+        log_warning("No non-AMD GPUs found. Make sure you have a GPU for the host system.")
     
     # In case of multiple AMD GPUs, ask the user to choose
     if len(amd_gpus) > 1:
@@ -310,6 +351,12 @@ def find_gpu_iommu_group(gpu, iommu_groups):
     for device in gpu_group_devices:
         log_info(f"  {device['description']}")
     
+    # Add warning about IOMMU group implications
+    log_warning("All devices in this IOMMU group will be bound to vfio-pci driver")
+    log_warning("This means they will be unavailable to the host system")
+    log_warning("If this group contains devices other than the GPU and its audio controller,")
+    log_warning("you may need to pass them through to your VM as well")
+    
     return gpu_group, gpu_group_devices
 
 
@@ -326,6 +373,28 @@ def get_device_ids(devices):
                 ids.append(id_pair)
     
     return ids
+
+
+def create_timestamped_backup(file_path, dry_run=False, debug=False):
+    """Create a timestamped backup of a file."""
+    if not os.path.exists(file_path):
+        log_debug(f"File {file_path} does not exist, no backup needed", debug)
+        return None
+    
+    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    backup_path = f"{file_path}.bak.{timestamp}"
+    
+    if dry_run:
+        log_debug(f"Would create backup of {file_path} to {backup_path}", debug)
+        return backup_path
+    
+    try:
+        shutil.copy2(file_path, backup_path)
+        log_info(f"Created backup of {file_path} to {backup_path}")
+        return backup_path
+    except Exception as e:
+        log_error(f"Failed to create backup of {file_path}: {str(e)}")
+        return None
 
 
 def configure_vfio_modules(device_ids, dry_run=False, debug=False):
@@ -393,9 +462,51 @@ def configure_vfio_modules(device_ids, dry_run=False, debug=False):
     return True
 
 
+def detect_bootloader():
+    """Detect the bootloader used by the system."""
+    # Check for GRUB
+    if os.path.exists('/etc/default/grub'):
+        if os.path.exists('/usr/sbin/update-grub'):
+            return "grub-debian"  # Debian/Ubuntu style
+        elif os.path.exists('/usr/sbin/grub2-mkconfig'):
+            return "grub-fedora"  # Fedora/RHEL style
+        elif os.path.exists('/usr/sbin/grub-mkconfig'):
+            return "grub-arch"    # Arch style
+        else:
+            return "grub-unknown"
+    
+    # Check for systemd-boot
+    if os.path.exists('/boot/efi/loader/loader.conf') or os.path.exists('/boot/loader/loader.conf'):
+        return "systemd-boot"
+    
+    # Check for LILO
+    if os.path.exists('/etc/lilo.conf'):
+        return "lilo"
+    
+    return "unknown"
+
+
 def configure_kernel_parameters(dry_run=False, debug=False):
     """Configure kernel parameters for IOMMU and VFIO."""
     log_info("Configuring kernel parameters...")
+    
+    # Detect bootloader
+    bootloader = detect_bootloader()
+    log_info(f"Detected bootloader: {bootloader}")
+    
+    if "grub" not in bootloader:
+        log_warning(f"This script primarily supports GRUB bootloader. Detected: {bootloader}")
+        log_warning("You may need to manually configure your bootloader with these parameters:")
+        log_warning("  amd_iommu=on iommu=pt rd.driver.pre=vfio-pci")
+        
+        # For systemd-boot, provide additional guidance
+        if bootloader == "systemd-boot":
+            log_info("For systemd-boot, you need to edit/create entries in /boot/loader/entries/")
+            log_info("Add the kernel parameters to the 'options' line in your entry file.")
+        
+        response = input("Continue anyway? (y/n): ").lower()
+        if response != 'y':
+            return False
     
     grub_path = '/etc/default/grub'
     
@@ -429,10 +540,21 @@ def configure_kernel_parameters(dry_run=False, debug=False):
     
     # Add required parameters if not already present
     required_params = [
-        "amd_iommu=on",
-        "iommu=pt",
+        "amd_iommu=on",  # AMD CPU
+        "iommu=pt",      # IOMMU passthrough mode (most efficient for VM passthrough)
         "rd.driver.pre=vfio-pci",
     ]
+    
+    # Ask for advanced parameters if in debug mode
+    if debug:
+        print("\nAdvanced IOMMU configuration options:")
+        print("1. iommu=pt (passthrough mode, recommended for best performance)")
+        print("2. iommu=on (default mode, may be more compatible with some systems)")
+        advanced_choice = input("Choose IOMMU mode (1/2) [default=1]: ")
+        
+        if advanced_choice == "2":
+            # Replace iommu=pt with iommu=on in required params
+            required_params = [p if not p.startswith("iommu=") else "iommu=on" for p in required_params]
     
     # Check which parameters need to be added
     params_to_add = []
@@ -478,14 +600,21 @@ def configure_kernel_parameters(dry_run=False, debug=False):
         return True
     
     # Create backup of the original file
-    shutil.copy2(grub_path, f"{grub_path}.bak")
-    log_info(f"Backed up GRUB configuration to {grub_path}.bak")
+    backup_path = create_timestamped_backup(grub_path, dry_run, debug)
+    if not backup_path and not dry_run:
+        log_error("Failed to create backup, aborting GRUB configuration update for safety")
+        return False
     
     # Update the GRUB configuration
     grub_content[cmdline_line_index] = f'GRUB_CMDLINE_LINUX_DEFAULT="{" ".join(parameters)}"\n'
     
-    with open(grub_path, 'w') as f:
-        f.writelines(grub_content)
+    try:
+        with open(grub_path, 'w') as f:
+            f.writelines(grub_content)
+    except Exception as e:
+        log_error(f"Failed to update GRUB configuration: {str(e)}")
+        log_error(f"You can restore from the backup: {backup_path}")
+        return False
     
     log_success(f"Updated GRUB configuration with parameters: {', '.join(params_to_add)}")
     
@@ -515,12 +644,26 @@ def configure_kernel_parameters(dry_run=False, debug=False):
         return True
     else:
         log_error("Failed to update GRUB configuration.")
+        log_error(f"You can restore from the backup: {backup_path}")
+        log_error("After restoring, manually update your bootloader configuration.")
         return False
 
 
 def update_initramfs(dry_run=False, debug=False):
     """Update the initramfs to include VFIO modules."""
     log_info("Updating initramfs...")
+    
+    # Check for space in /boot
+    boot_space_output = run_command("df -h /boot", dry_run, debug)
+    if boot_space_output:
+        usage_match = re.search(r"(\d+)%", boot_space_output)
+        if usage_match and int(usage_match.group(1)) > 90:
+            log_warning("Warning: /boot partition is over 90% full!")
+            log_warning("The initramfs update might fail due to insufficient space.")
+            log_warning("Consider cleaning up old kernels before proceeding.")
+            response = input("Continue anyway? (y/n): ").lower()
+            if response != 'y':
+                return False
     
     # Determine the command to update initramfs based on the distribution
     if os.path.exists('/usr/sbin/update-initramfs'):
@@ -545,6 +688,9 @@ def update_initramfs(dry_run=False, debug=False):
         return True
     else:
         log_error("Failed to update initramfs.")
+        log_error("Your system may not boot properly until this is resolved.")
+        log_error("Please check /boot partition space and permissions, then manually run:")
+        log_error(f"  sudo {initramfs_command}")
         return False
 
 
@@ -701,55 +847,100 @@ def create_cleanup_script(changes, dry_run=False, debug=False):
     """Create a script to revert all changes made."""
     log_info("Creating cleanup script...")
     
-    script_path = "/home/xiao/Documents/source/repo/vfio/vfio_cleanup.sh"
+    script_path = os.path.join(SCRIPT_DIR, "vfio_cleanup.sh")
     script_content = "#!/bin/bash\n\n"
     script_content += "# VFIO Cleanup Script\n"
     script_content += "# This script will revert the changes made by the VFIO setup script\n\n"
-    
+    script_content += "# Exit on error\nset -e\n\n"
     script_content += "echo 'Starting VFIO cleanup...'\n\n"
     
     # Handle files created or modified
     if "files" in changes:
         script_content += "# Reverting file changes\n"
         for change in changes["files"]:
+            # Find the most recent backup before our changes
             if change["content"] == "created":
-                script_content += f"echo 'Removing file {change['item']}'\n"
-                script_content += f"rm -f '{change['item']}'\n\n"
+                script_content += f"if [ -f '{change['item']}' ]; then\n"
+                script_content += f"  echo 'Removing file {change['item']}'\n"
+                script_content += f"  rm -f '{change['item']}'\n"
+                script_content += "else\n"
+                script_content += f"  echo 'File {change['item']} already removed'\n"
+                script_content += "fi\n\n"
             elif change["content"] == "modified":
-                if os.path.exists(f"{change['item']}.bak"):
-                    script_content += f"echo 'Restoring original file {change['item']}'\n"
-                    script_content += f"cp -f '{change['item']}.bak' '{change['item']}'\n\n"
+                # Find the most recent backup
+                if "backup_path" in change:
+                    backup_path = change["backup_path"]
+                    script_content += f"if [ -f '{backup_path}' ]; then\n"
+                    script_content += f"  if [ -f '{change['item']}' ]; then\n"
+                    script_content += f"    echo 'Checking if {change['item']} needs restoration...'\n"
+                    script_content += f"    if ! cmp -s '{change['item']}' '{backup_path}'; then\n"
+                    script_content += f"      echo 'Restoring {change['item']} from {backup_path}'\n"
+                    script_content += f"      cp -f '{backup_path}' '{change['item']}'\n"
+                    script_content += "    else\n"
+                    script_content += f"      echo 'No restoration needed for {change['item']}'\n"
+                    script_content += "    fi\n"
+                    script_content += "  else\n"
+                    script_content += f"    echo 'File {change['item']} not found, restoring from backup'\n"
+                    script_content += f"    cp -f '{backup_path}' '{change['item']}'\n"
+                    script_content += "  fi\n"
+                    script_content += "else\n"
+                    script_content += f"  echo 'Warning: Backup {backup_path} not found, cannot restore {change['item']}'\n"
+                    script_content += "fi\n\n"
     
     # Handle initramfs updates
     if "initramfs" in changes:
         script_content += "# Updating initramfs after reverting changes\n"
+        script_content += "echo 'Updating initramfs...'\n"
         if os.path.exists('/usr/sbin/update-initramfs'):
-            script_content += "update-initramfs -u -k all\n\n"
+            script_content += "if ! update-initramfs -u -k all; then\n"
+            script_content += "  echo 'Failed to update initramfs. Please update manually.'\n"
+            script_content += "  exit 1\n"
+            script_content += "fi\n\n"
         elif os.path.exists('/usr/bin/dracut'):
-            script_content += "dracut --force --regenerate-all\n\n"
+            script_content += "if ! dracut --force --regenerate-all; then\n"
+            script_content += "  echo 'Failed to update initramfs. Please update manually.'\n"
+            script_content += "  exit 1\n"
+            script_content += "fi\n\n"
     
     # Handle GRUB updates
     if "grub" in changes:
         script_content += "# Updating GRUB after reverting changes\n"
+        script_content += "echo 'Updating bootloader configuration...'\n"
         if os.path.exists('/usr/sbin/update-grub'):
-            script_content += "update-grub\n\n"
+            script_content += "if ! update-grub; then\n"
+            script_content += "  echo 'Failed to update GRUB. Please update manually.'\n"
+            script_content += "  exit 1\n"
+            script_content += "fi\n\n"
         elif os.path.exists('/usr/sbin/grub2-mkconfig'):
-            script_content += "grub2-mkconfig -o /boot/grub2/grub.cfg\n\n"
+            script_content += "if ! grub2-mkconfig -o /boot/grub2/grub.cfg; then\n"
+            script_content += "  echo 'Failed to update GRUB. Please update manually.'\n"
+            script_content += "  exit 1\n"
+            script_content += "fi\n\n"
         elif os.path.exists('/usr/sbin/grub-mkconfig'):
             if os.path.exists('/boot/grub/grub.cfg'):
-                script_content += "grub-mkconfig -o /boot/grub/grub.cfg\n\n"
+                script_content += "if ! grub-mkconfig -o /boot/grub/grub.cfg; then\n"
+                script_content += "  echo 'Failed to update GRUB. Please update manually.'\n"
+                script_content += "  exit 1\n"
+                script_content += "fi\n\n"
             elif os.path.exists('/boot/grub2/grub.cfg'):
-                script_content += "grub-mkconfig -o /boot/grub2/grub.cfg\n\n"
+                script_content += "if ! grub-mkconfig -o /boot/grub2/grub.cfg; then\n"
+                script_content += "  echo 'Failed to update GRUB. Please update manually.'\n"
+                script_content += "  exit 1\n"
+                script_content += "fi\n\n"
     
     # Handle BTRFS snapshot
     if "btrfs" in changes:
         script_content += "# Note about BTRFS snapshot\n"
         for change in changes["btrfs"]:
-            script_content += f"echo 'A BTRFS snapshot was created at {change['item']}'\n"
-            script_content += "echo 'You can manually restore from this snapshot with:'\n"
-            script_content += f"echo \"  sudo btrfs subvolume snapshot {change['item']} /\"\n"
-            script_content += "echo 'Or delete it with:'\n"
-            script_content += f"echo \"  sudo btrfs subvolume delete {change['item']}\"\n\n"
+            script_content += f"if [ -d '{change['item']}' ]; then\n"
+            script_content += f"  echo 'A BTRFS snapshot was created at {change['item']}'\n"
+            script_content += "  echo 'You can manually restore from this snapshot with:'\n"
+            script_content += f"  echo \"  sudo btrfs subvolume snapshot {change['item']} /\"\n"
+            script_content += "  echo 'Or delete it with:'\n"
+            script_content += f"  echo \"  sudo btrfs subvolume delete {change['item']}\"\n"
+            script_content += "else\n"
+            script_content += f"  echo 'BTRFS snapshot at {change['item']} no longer exists'\n"
+            script_content += "fi\n\n"
     
     script_content += "echo 'VFIO cleanup complete. Please reboot your system for changes to take effect.'\n"
     
@@ -763,14 +954,18 @@ def create_cleanup_script(changes, dry_run=False, debug=False):
         log_success("[DRY RUN] Cleanup script would be created")
         return script_path
     
-    with open(script_path, "w") as f:
-        f.write(script_content)
-    
-    os.chmod(script_path, 0o755)
-    log_success(f"Cleanup script created: {script_path}")
-    log_info(f"You can run this script to revert all changes made by the VFIO setup.")
-    
-    return script_path
+    try:
+        with open(script_path, "w") as f:
+            f.write(script_content)
+        
+        os.chmod(script_path, 0o755)
+        log_success(f"Cleanup script created: {script_path}")
+        log_info(f"You can run this script to revert all changes made by the VFIO setup.")
+        
+        return script_path
+    except Exception as e:
+        log_error(f"Failed to create cleanup script: {str(e)}")
+        return None
 
 
 def gather_system_info():
@@ -843,6 +1038,10 @@ def display_system_summary(system_info):
     
     if system_info.get("gpu_iommu_group"):
         print(f"  {Colors.GREEN}✓{Colors.ENDC} GPU is in IOMMU group {system_info['gpu_iommu_group']}")
+        
+        # Add IOMMU group implications
+        if system_info.get("gpu_group_devices") and len(system_info["gpu_group_devices"]) > 1:
+            print(f"  {Colors.YELLOW}!{Colors.ENDC} This group has multiple devices that will ALL be unavailable to the host")
     elif system_info.get("gpu_for_passthrough"):
         print(f"  {Colors.RED}✗{Colors.ENDC} Could not determine GPU IOMMU group (required)")
     
@@ -906,18 +1105,26 @@ def interactive_setup(system_info, dry_run=False, debug=False):
         if response == 'y':
             # Backup grub file before modification
             grub_path = '/etc/default/grub'
-            if os.path.exists(grub_path) and not dry_run:
-                shutil.copy2(grub_path, f"{grub_path}.bak")
-                changes = track_change(changes, "files", grub_path, "modified")
-            elif dry_run:
-                log_debug(f"Would backup {grub_path} to {grub_path}.bak", debug)
-                changes = track_change(changes, "files", grub_path, "modified")
+            backup_path = None
+            
+            if os.path.exists(grub_path):
+                backup_path = create_timestamped_backup(grub_path, dry_run, debug)
+                if backup_path:
+                    changes = track_change(changes, "files", grub_path, "modified")
+                    # Store backup path for cleanup
+                    if "files" in changes and any(c["item"] == grub_path for c in changes["files"]):
+                        for c in changes["files"]:
+                            if c["item"] == grub_path:
+                                c["backup_path"] = backup_path
+                                break
             
             if configure_kernel_parameters(dry_run, debug):
                 changes = track_change(changes, "grub", "updated", "IOMMU parameters added")
                 log_success("Kernel parameters configured successfully.")
             else:
                 log_error("Failed to configure kernel parameters.")
+                log_error("Cannot continue without proper IOMMU configuration.")
+                return False
     
     # Configure VFIO modules
     if system_info.get("device_ids"):
@@ -926,22 +1133,30 @@ def interactive_setup(system_info, dry_run=False, debug=False):
         if response == 'y':
             # Track files that will be modified
             vfio_conf = '/etc/modprobe.d/vfio.conf'
-            if os.path.exists(vfio_conf) and not dry_run:
-                shutil.copy2(vfio_conf, f"{vfio_conf}.bak")
-                changes = track_change(changes, "files", vfio_conf, "modified")
-            elif dry_run and os.path.exists(vfio_conf):
-                log_debug(f"Would backup {vfio_conf} to {vfio_conf}.bak", debug)
-                changes = track_change(changes, "files", vfio_conf, "modified")
+            if os.path.exists(vfio_conf):
+                backup_path = create_timestamped_backup(vfio_conf, dry_run, debug)
+                if backup_path:
+                    changes = track_change(changes, "files", vfio_conf, "modified")
+                    # Store backup path for cleanup
+                    if "files" in changes and any(c["item"] == vfio_conf for c in changes["files"]):
+                        for c in changes["files"]:
+                            if c["item"] == vfio_conf:
+                                c["backup_path"] = backup_path
+                                break
             else:
                 changes = track_change(changes, "files", vfio_conf, "created")
             
             modules_load = '/etc/modules-load.d/vfio.conf'
-            if os.path.exists(modules_load) and not dry_run:
-                shutil.copy2(modules_load, f"{modules_load}.bak")
-                changes = track_change(changes, "files", modules_load, "modified")
-            elif dry_run and os.path.exists(modules_load):
-                log_debug(f"Would backup {modules_load} to {modules_load}.bak", debug)
-                changes = track_change(changes, "files", modules_load, "modified")
+            if os.path.exists(modules_load):
+                backup_path = create_timestamped_backup(modules_load, dry_run, debug)
+                if backup_path:
+                    changes = track_change(changes, "files", modules_load, "modified")
+                    # Store backup path for cleanup
+                    if "files" in changes and any(c["item"] == modules_load for c in changes["files"]):
+                        for c in changes["files"]:
+                            if c["item"] == modules_load:
+                                c["backup_path"] = backup_path
+                                break
             else:
                 changes = track_change(changes, "files", modules_load, "created")
             
@@ -950,6 +1165,8 @@ def interactive_setup(system_info, dry_run=False, debug=False):
                 log_success("VFIO modules configured successfully.")
             else:
                 log_error("Failed to configure VFIO modules.")
+                log_error("Cannot continue without proper VFIO configuration.")
+                return False
     
     # Update initramfs
     if "vfio" in changes or "grub" in changes:
@@ -961,6 +1178,8 @@ def interactive_setup(system_info, dry_run=False, debug=False):
                 log_success("Initramfs updated successfully.")
             else:
                 log_error("Failed to update initramfs.")
+                log_error("Your system may not boot properly. Please resolve the issue.")
+                return False
     
     # Install virtualization software if needed
     if not system_info["libvirt_installed"]:
@@ -988,6 +1207,7 @@ def interactive_setup(system_info, dry_run=False, debug=False):
                         log_success("Virtualization software installed successfully.")
                     else:
                         log_error("Failed to install virtualization software.")
+                        log_warning("You will need to install it manually to use VFIO passthrough.")
             else:
                 log_warning("Could not determine package manager for installation.")
                 log_info("Please install libvirt, qemu-kvm, and virt-manager manually.")
@@ -999,17 +1219,21 @@ def interactive_setup(system_info, dry_run=False, debug=False):
             cleanup_script = create_cleanup_script(changes, dry_run, debug)
             
             # Save the changes to a JSON file for reference
-            changes_file = "/home/xiao/Documents/source/repo/vfio/vfio_changes.json"
+            changes_file = os.path.join(SCRIPT_DIR, "vfio_changes.json")
             
             if dry_run:
                 log_debug(f"Would write changes to {changes_file}", debug)
                 log_debug(f"Changes content: {json.dumps(changes, indent=2)}", debug)
                 log_success("[DRY RUN] Changes would be tracked for later cleanup")
             else:
-                with open(changes_file, 'w') as f:
-                    json.dump(changes, f, indent=2)
-                
-                log_success(f"Changes have been tracked in {changes_file}")
+                try:
+                    with open(changes_file, 'w') as f:
+                        json.dump(changes, f, indent=2)
+                    
+                    log_success(f"Changes have been tracked in {changes_file}")
+                except Exception as e:
+                    log_error(f"Failed to save changes to {changes_file}: {str(e)}")
+                    log_warning("Cleanup script may not be able to restore all changes.")
         except Exception as e:
             log_error(f"Error creating cleanup information: {str(e)}")
             log_warning("You may need to manually revert changes if needed.")
@@ -1063,7 +1287,19 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='Simulate all operations without making actual changes')
     parser.add_argument('--debug', action='store_true', help='Enable verbose debug output')
     parser.add_argument('--cleanup', action='store_true', help='Run cleanup script if it exists')
+    parser.add_argument('--output-dir', type=str, default=SCRIPT_DIR, 
+                        help='Directory to store output files (cleanup script, changes log)')
     args = parser.parse_args()
+    
+    # Update script dir if output-dir is specified
+    global SCRIPT_DIR
+    if args.output_dir != SCRIPT_DIR:
+        if os.path.isdir(args.output_dir):
+            SCRIPT_DIR = args.output_dir
+            log_info(f"Using output directory: {SCRIPT_DIR}")
+        else:
+            log_error(f"Output directory {args.output_dir} does not exist")
+            return 1
     
     print(f"{Colors.BOLD}{'=' * 80}{Colors.ENDC}")
     if args.dry_run:
@@ -1078,14 +1314,19 @@ def main():
     if args.dry_run:
         log_warning("Dry run mode: changes will be simulated but not actually made")
     
+    # Check dependencies first
+    if not check_dependencies():
+        log_error("Missing required dependencies. Please install them and try again.")
+        return 1
+    
     # Run cleanup if requested
     if args.cleanup:
-        cleanup_script = "/home/xiao/Documents/source/repo/vfio/vfio_cleanup.sh"
+        cleanup_script = os.path.join(SCRIPT_DIR, "vfio_cleanup.sh")
         if os.path.exists(cleanup_script):
             if args.dry_run:
                 log_debug(f"Would run cleanup script: {cleanup_script}", args.debug)
                 log_success("[DRY RUN] Cleanup would be performed")
-                return
+                return 0
             
             log_info(f"Running cleanup script: {cleanup_script}")
             result = run_command(f"bash {cleanup_script}", args.dry_run, args.debug)
@@ -1093,15 +1334,15 @@ def main():
                 log_success("Cleanup completed successfully.")
             else:
                 log_error("Cleanup failed.")
-            return
+            return 0
         else:
-            log_error("Cleanup script not found.")
-            return
+            log_error(f"Cleanup script not found at {cleanup_script}")
+            return 1
     
     # Check if running as root
     if os.geteuid() != 0:
         log_error("This script must be run as root (with sudo).")
-        sys.exit(1)
+        return 1
     
     # Gather all system information
     system_info = gather_system_info()
@@ -1115,7 +1356,7 @@ def main():
         proceed = input("Do you want to proceed with the VFIO setup? (y/n): ").lower()
         if proceed != 'y':
             log_info("Setup canceled by user.")
-            sys.exit(0)
+            return 0
     else:
         print("Since this is a dry run, we'll simulate the setup process.")
     
@@ -1130,17 +1371,18 @@ def main():
             log_info("Run without --dry-run to make actual changes.")
         else:
             log_success("VFIO GPU passthrough setup complete!")
-            log_info("To revert all changes, run: sudo python3 vfio.py --cleanup")
+            log_info(f"To revert all changes, run: sudo python3 {os.path.basename(__file__)} --cleanup")
             log_info("Please reboot your system for the changes to take effect.")
         
         log_info("After reboot, verify that the AMD GPU is bound to the vfio-pci driver with:")
         log_info("  lspci -nnk | grep -A3 'VGA\\|Display'")
         log_info("Then you can use virt-manager to set up a VM with the passed-through GPU.")
         print(f"{Colors.BOLD}{'=' * 80}{Colors.ENDC}")
+        return 0
     else:
         log_error("VFIO setup failed.")
-        sys.exit(1)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
