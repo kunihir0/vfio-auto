@@ -25,10 +25,14 @@ from pathlib import Path
 import argparse
 import json
 import datetime
+import functools
 
 
 # Get the directory where the script is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Cache for frequently accessed system information
+_SYSTEM_CACHE = {}
 
 
 class Colors:
@@ -67,6 +71,52 @@ def log_debug(message, debug=False):
         print(f"{Colors.BLUE}[DEBUG]{Colors.ENDC} {message}")
 
 
+def cached_result(key):
+    """Decorator to cache function results."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if key not in _SYSTEM_CACHE:
+                _SYSTEM_CACHE[key] = func(*args, **kwargs)
+            return _SYSTEM_CACHE[key]
+        return wrapper
+    return decorator
+
+
+@cached_result('kernel_cmdline')
+def get_kernel_cmdline():
+    """Get the kernel command line parameters."""
+    try:
+        return Path("/proc/cmdline").read_text().strip()
+    except Exception as e:
+        log_error(f"Failed to read kernel command line: {str(e)}")
+        return ""
+
+
+def detect_bootloader():
+    """Detect the bootloader used by the system."""
+    # Check for GRUB
+    if os.path.exists('/etc/default/grub'):
+        if os.path.exists('/usr/sbin/update-grub'):
+            return "grub-debian"  # Debian/Ubuntu style
+        elif os.path.exists('/usr/sbin/grub2-mkconfig'):
+            return "grub-fedora"  # Fedora/RHEL style
+        elif os.path.exists('/usr/sbin/grub-mkconfig'):
+            return "grub-arch"    # Arch style
+        else:
+            return "grub-unknown"
+    
+    # Check for systemd-boot
+    if os.path.exists('/boot/efi/loader/loader.conf') or os.path.exists('/boot/loader/loader.conf'):
+        return "systemd-boot"
+    
+    # Check for LILO
+    if os.path.exists('/etc/lilo.conf'):
+        return "lilo"
+    
+    return "unknown"
+
+
 def check_dependencies():
     """Check if all required commands are available."""
     log_info("Checking for required dependencies...")
@@ -76,12 +126,24 @@ def check_dependencies():
         "cat", "ls", "df", "test"
     ]
     
-    # Check for bootloader/initramfs update commands
-    # We don't require all of them, just the ones appropriate for the system
+    # Check for bootloader/initramfs update commands based on the actual bootloader
+    bootloader = detect_bootloader()
     update_commands = {
-        "grub": ["update-grub", "grub-mkconfig", "grub2-mkconfig"],
-        "initramfs": ["update-initramfs", "dracut"]
+        "grub-debian": ["update-grub"],
+        "grub-fedora": ["grub2-mkconfig"],
+        "grub-arch": ["grub-mkconfig"],
+        "systemd-boot": [],  # No special commands needed for systemd-boot
+        "lilo": ["lilo"],
+        "unknown": ["update-grub", "grub-mkconfig", "grub2-mkconfig"]  # Check all for unknown
     }
+    
+    # Add initramfs commands based on possible systems
+    if os.path.exists('/etc/debian_version'):
+        update_commands["initramfs"] = ["update-initramfs"]
+    elif os.path.exists('/etc/fedora-release') or os.path.exists('/etc/redhat-release'):
+        update_commands["initramfs"] = ["dracut"]
+    else:
+        update_commands["initramfs"] = ["update-initramfs", "dracut"]  # Check both for unknown
     
     missing_commands = []
     for cmd in required_commands:
@@ -93,11 +155,17 @@ def check_dependencies():
         log_error("Please install these dependencies before running the script.")
         return False
     
-    # Check for at least one update command from each category
-    for category, cmds in update_commands.items():
-        if not any(shutil.which(cmd) for cmd in cmds):
-            log_warning(f"Missing {category} update command. The script may not work correctly.")
-            log_warning(f"Required at least one of: {', '.join(cmds)}")
+    # Check for necessary bootloader commands
+    bootloader_cmds = update_commands.get(bootloader, [])
+    if bootloader_cmds and not any(shutil.which(cmd) for cmd in bootloader_cmds):
+        log_warning(f"Missing bootloader update command for {bootloader}.")
+        log_warning(f"Required at least one of: {', '.join(bootloader_cmds)}")
+    
+    # Check for necessary initramfs commands
+    initramfs_cmds = update_commands.get("initramfs", [])
+    if not any(shutil.which(cmd) for cmd in initramfs_cmds):
+        log_warning(f"Missing initramfs update command.")
+        log_warning(f"Required at least one of: {', '.join(initramfs_cmds)}")
     
     log_success("All required dependencies are available.")
     return True
@@ -116,7 +184,7 @@ def run_command(command, dry_run=False, debug=False):
                     check=True, 
                     stdout=subprocess.PIPE, 
                     stderr=subprocess.PIPE, 
-                    universal_newlines=True
+                    text=True  # Using text=True instead of universal_newlines=True
                 )
                 log_debug(f"Command output: {result.stdout.strip()}", debug)
                 return result.stdout.strip()
@@ -134,7 +202,7 @@ def run_command(command, dry_run=False, debug=False):
             check=True, 
             stdout=subprocess.PIPE, 
             stderr=subprocess.PIPE, 
-            universal_newlines=True
+            text=True  # Using text=True instead of universal_newlines=True
         )
         if debug:
             log_debug(f"Command output: {result.stdout.strip()}", debug)
@@ -153,6 +221,7 @@ def check_root():
     log_success("Running with root privileges.")
 
 
+@cached_result('cpu_vendor')
 def check_cpu_vendor():
     """Check if the CPU is from AMD."""
     log_info("Checking CPU vendor...")
@@ -183,12 +252,48 @@ def check_cpu_virtualization():
         return False
 
 
+def check_secure_boot():
+    """Check if Secure Boot is enabled."""
+    log_info("Checking Secure Boot status...")
+    
+    # Check if mokutil is installed
+    if shutil.which("mokutil"):
+        result = run_command("mokutil --sb-state")
+        if result and "enabled" in result.lower():
+            log_warning("Secure Boot is enabled. This might interfere with loading unsigned kernel modules.")
+            log_warning("Consider disabling Secure Boot or signing your VFIO modules.")
+            return True
+        elif result and "disabled" in result.lower():
+            log_success("Secure Boot is disabled.")
+            return False
+        else:
+            log_warning("Could not determine Secure Boot status with mokutil.")
+    
+    # Alternative check via EFI variables
+    if os.path.exists("/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"):
+        try:
+            with open("/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c", "rb") as f:
+                data = f.read()
+                if len(data) >= 5 and data[4] == 1:
+                    log_warning("Secure Boot is enabled. This might interfere with loading unsigned kernel modules.")
+                    log_warning("Consider disabling Secure Boot or signing your VFIO modules.")
+                    return True
+                elif len(data) >= 5:
+                    log_success("Secure Boot is disabled.")
+                    return False
+        except Exception:
+            pass
+    
+    log_warning("Could not determine Secure Boot status. If enabled, it might interfere with module loading.")
+    return None
+
+
 def check_iommu():
     """Check if IOMMU is enabled."""
     log_info("Checking IOMMU status...")
     
     # Check kernel command line for IOMMU
-    cmdline = Path("/proc/cmdline").read_text()
+    cmdline = get_kernel_cmdline()
     
     # Check if IOMMU is enabled at all
     iommu_enabled = "amd_iommu=on" in cmdline or "intel_iommu=on" in cmdline
@@ -212,7 +317,7 @@ def check_kernel_cmdline_conflicts():
     """Check for VFIO device IDs on the kernel command line."""
     log_info("Checking for VFIO configuration in kernel command line...")
     
-    cmdline = Path("/proc/cmdline").read_text()
+    cmdline = get_kernel_cmdline()
     
     # Check for VFIO device IDs on the kernel command line
     vfio_ids_pattern = re.search(r'vfio-pci\.ids=([^\s]+)', cmdline)
@@ -305,6 +410,48 @@ def get_gpus():
             log_info(f"  Driver: {gpu['driver']}")
     
     return gpus
+
+
+def check_host_gpu_driver(gpus):
+    """Check if the host GPU (non-passthrough) has a working driver."""
+    log_info("Checking host GPU driver status...")
+    
+    nvidia_gpus = [gpu for gpu in gpus if gpu['vendor'] == 'NVIDIA']
+    other_gpus = [gpu for gpu in gpus if gpu['vendor'] != 'AMD']
+    
+    if not other_gpus:
+        log_warning("No non-AMD GPUs found for host system. This configuration may not work correctly.")
+        return False
+    
+    if nvidia_gpus:
+        # Check specifically for NVIDIA drivers if NVIDIA GPUs are present
+        nvidia_gpu = nvidia_gpus[0]
+        if 'driver' in nvidia_gpu:
+            driver = nvidia_gpu['driver']
+            if driver == 'nvidia':
+                log_success(f"NVIDIA GPU is using the proprietary nvidia driver: {nvidia_gpu['description']}")
+                return True
+            elif driver == 'nouveau':
+                log_warning(f"NVIDIA GPU is using the open-source nouveau driver: {nvidia_gpu['description']}")
+                log_warning("The proprietary nvidia driver generally provides better performance.")
+                return True
+            elif driver:
+                log_warning(f"NVIDIA GPU has unexpected driver '{driver}': {nvidia_gpu['description']}")
+                return False
+            else:
+                log_error(f"NVIDIA GPU has no driver loaded: {nvidia_gpu['description']}")
+                return False
+    elif other_gpus:
+        # Check for any non-AMD GPU
+        host_gpu = other_gpus[0]
+        if 'driver' in host_gpu and host_gpu['driver']:
+            log_success(f"Host GPU has a driver loaded ({host_gpu['driver']}): {host_gpu['description']}")
+            return True
+        else:
+            log_error(f"Host GPU has no driver loaded: {host_gpu['description']}")
+            return False
+    
+    return False
 
 
 def find_gpu_for_passthrough(gpus):
@@ -998,12 +1145,33 @@ def create_cleanup_script(changes, dry_run=False, debug=False):
             script_content += f"  echo 'BTRFS snapshot at {change['item']} no longer exists'\n"
             script_content += "fi\n\n"
     
+    # Add optional package removal section
+    script_content += "# Optional: Package removal (uncomment to use)\n"
+    script_content += "# WARNING: This will remove virtualization packages which may be used by other VMs\n"
+    script_content += "# function remove_virtualization_packages() {\n"
+    script_content += "#   echo \"Removing virtualization packages...\"\n"
+    script_content += "#   if command -v apt-get >/dev/null 2>&1; then\n"
+    script_content += "#     apt-get remove -y libvirt-daemon qemu-kvm virt-manager\n"
+    script_content += "#   elif command -v dnf >/dev/null 2>&1; then\n"
+    script_content += "#     dnf remove -y libvirt qemu-kvm virt-manager\n"
+    script_content += "#   elif command -v pacman >/dev/null 2>&1; then\n"
+    script_content += "#     pacman -Rs libvirt qemu virt-manager\n"
+    script_content += "#   else\n"
+    script_content += "#     echo \"Could not determine package manager. Please remove packages manually.\"\n"
+    script_content += "#     return 1\n"
+    script_content += "#   fi\n"
+    script_content += "#   echo \"Virtualization packages removed.\"\n"
+    script_content += "# }\n"
+    script_content += "# # Uncomment the next line to remove virtualization packages\n"
+    script_content += "# # remove_virtualization_packages\n\n"
+    
     # Add note about package installations
     script_content += "# Note about package installations\n"
     script_content += "echo \"\"\n"
     script_content += "echo \"Note: If virtualization software (libvirt, qemu, virt-manager) was installed,\"\n"
     script_content += "echo \"this cleanup script does not automatically remove it. You may need to\"\n"
     script_content += "echo \"uninstall these packages manually if desired.\"\n"
+    script_content += "echo \"(Uncomment the 'remove_virtualization_packages' line in this script to do so)\"\n"
     script_content += "echo \"\"\n"
     
     script_content += "echo 'VFIO cleanup complete. Please reboot your system for changes to take effect.'\n"
@@ -1045,11 +1213,15 @@ def gather_system_info():
         "btrfs_system": check_btrfs(),
         "gpus": get_gpus(),
         "libvirt_installed": check_libvirt_installed(),
-        "kernel_cmdline_conflicts": check_kernel_cmdline_conflicts()
+        "kernel_cmdline_conflicts": check_kernel_cmdline_conflicts(),
+        "secure_boot": check_secure_boot()
     }
     
     if system_info["gpus"]:
         system_info["gpu_for_passthrough"] = find_gpu_for_passthrough(system_info["gpus"])
+        # Check host GPU driver
+        system_info["host_gpu_driver_ok"] = check_host_gpu_driver(system_info["gpus"])
+        
         if system_info["gpu_for_passthrough"]:
             iommu_groups = get_iommu_groups()
             if iommu_groups:
