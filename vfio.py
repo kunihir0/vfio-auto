@@ -25,7 +25,6 @@ from pathlib import Path
 import argparse
 import json
 import datetime
-import time
 
 
 # Get the directory where the script is located
@@ -154,6 +153,21 @@ def check_root():
     log_success("Running with root privileges.")
 
 
+def check_cpu_vendor():
+    """Check if the CPU is from AMD."""
+    log_info("Checking CPU vendor...")
+    
+    vendor_id = run_command("grep -m1 'vendor_id' /proc/cpuinfo | awk '{print $3}'")
+    
+    if vendor_id == "AuthenticAMD":
+        log_success("CPU vendor is AMD.")
+        return True
+    else:
+        log_error(f"CPU vendor is {vendor_id}, but this script is tailored for AMD systems.")
+        log_error("The script may not work correctly with your CPU.")
+        return False
+
+
 def check_cpu_virtualization():
     """Check if CPU virtualization is enabled."""
     log_info("Checking CPU virtualization...")
@@ -176,12 +190,42 @@ def check_iommu():
     # Check kernel command line for IOMMU
     cmdline = Path("/proc/cmdline").read_text()
     
-    if "amd_iommu=on" in cmdline and "iommu=pt" in cmdline:
-        log_success("IOMMU is properly enabled.")
+    # Check if IOMMU is enabled at all
+    iommu_enabled = "amd_iommu=on" in cmdline or "intel_iommu=on" in cmdline
+    
+    # Check if IOMMU is in passthrough mode
+    iommu_pt = "iommu=pt" in cmdline
+    
+    if iommu_enabled and iommu_pt:
+        log_success("IOMMU is properly enabled in passthrough mode.")
         return True
-    else:
-        log_warning("IOMMU is not properly enabled in kernel parameters.")
+    elif iommu_enabled:
+        log_warning("IOMMU is enabled, but not in passthrough mode (iommu=pt).")
+        log_warning("Passthrough mode is recommended for optimal performance.")
         return False
+    else:
+        log_warning("IOMMU is not enabled in kernel parameters.")
+        return False
+
+
+def check_kernel_cmdline_conflicts():
+    """Check for VFIO device IDs on the kernel command line."""
+    log_info("Checking for VFIO configuration in kernel command line...")
+    
+    cmdline = Path("/proc/cmdline").read_text()
+    
+    # Check for VFIO device IDs on the kernel command line
+    vfio_ids_pattern = re.search(r'vfio-pci\.ids=([^\s]+)', cmdline)
+    
+    if vfio_ids_pattern:
+        vfio_ids = vfio_ids_pattern.group(1)
+        log_warning("VFIO device IDs are specified on the kernel command line:")
+        log_warning(f"  vfio-pci.ids={vfio_ids}")
+        log_warning("This script will set up VFIO via /etc/modprobe.d/vfio.conf, which is generally preferred.")
+        log_warning("Having both configurations may lead to unexpected behavior.")
+        return True
+    
+    return False
 
 
 def check_vfio_modules():
@@ -542,7 +586,9 @@ def configure_kernel_parameters(dry_run=False, debug=False):
     required_params = [
         "amd_iommu=on",  # AMD CPU
         "iommu=pt",      # IOMMU passthrough mode (most efficient for VM passthrough)
-        "rd.driver.pre=vfio-pci",
+        "rd.driver.pre=vfio-pci",  # Force vfio-pci to load very early in initramfs
+        # Note: rd.driver.pre=vfio-pci is generally needed for proper GPU passthrough,
+        # but some modern dracut configurations might handle this automatically
     ]
     
     # Ask for advanced parameters if in debug mode
@@ -577,10 +623,17 @@ def configure_kernel_parameters(dry_run=False, debug=False):
     # Add the parameters
     parameters.extend(params_to_add)
     
+    # Create the final parameter string for display/non-GRUB users
+    final_params_string = " ".join(parameters)
+    
+    # For non-GRUB bootloaders, provide the exact string to copy-paste
+    if "grub" not in bootloader:
+        log_info(f"The required kernel options line is: {final_params_string}")
+    
     if dry_run:
         log_debug(f"Would update GRUB configuration in {grub_path}", debug)
         log_debug(f"New parameters: {params_to_add}", debug)
-        log_debug(f"New GRUB_CMDLINE_LINUX_DEFAULT value: {' '.join(parameters)}", debug)
+        log_debug(f"New GRUB_CMDLINE_LINUX_DEFAULT value: {final_params_string}", debug)
         
         grub_update_command = None
         if os.path.exists('/usr/sbin/update-grub'):
@@ -606,7 +659,7 @@ def configure_kernel_parameters(dry_run=False, debug=False):
         return False
     
     # Update the GRUB configuration
-    grub_content[cmdline_line_index] = f'GRUB_CMDLINE_LINUX_DEFAULT="{" ".join(parameters)}"\n'
+    grub_content[cmdline_line_index] = f'GRUB_CMDLINE_LINUX_DEFAULT="{final_params_string}"\n'
     
     try:
         with open(grub_path, 'w') as f:
@@ -875,13 +928,13 @@ def create_cleanup_script(changes, dry_run=False, debug=False):
                     script_content += f"    echo 'Checking if {change['item']} needs restoration...'\n"
                     script_content += f"    if ! cmp -s '{change['item']}' '{backup_path}'; then\n"
                     script_content += f"      echo 'Restoring {change['item']} from {backup_path}'\n"
-                    script_content += f"      cp -f '{backup_path}' '{change['item']}'\n"
+                    script_content += f"      cp -pf '{backup_path}' '{change['item']}'\n"
                     script_content += "    else\n"
                     script_content += f"      echo 'No restoration needed for {change['item']}'\n"
                     script_content += "    fi\n"
                     script_content += "  else\n"
                     script_content += f"    echo 'File {change['item']} not found, restoring from backup'\n"
-                    script_content += f"    cp -f '{backup_path}' '{change['item']}'\n"
+                    script_content += f"    cp -pf '{backup_path}' '{change['item']}'\n"
                     script_content += "  fi\n"
                     script_content += "else\n"
                     script_content += f"  echo 'Warning: Backup {backup_path} not found, cannot restore {change['item']}'\n"
@@ -974,12 +1027,14 @@ def gather_system_info():
     
     system_info = {
         "root_privileges": os.geteuid() == 0,
+        "cpu_vendor": check_cpu_vendor(),
         "cpu_virtualization": check_cpu_virtualization(),
         "iommu_enabled": check_iommu(),
         "vfio_modules_loaded": check_vfio_modules(),
         "btrfs_system": check_btrfs(),
         "gpus": get_gpus(),
-        "libvirt_installed": check_libvirt_installed()
+        "libvirt_installed": check_libvirt_installed(),
+        "kernel_cmdline_conflicts": check_kernel_cmdline_conflicts()
     }
     
     if system_info["gpus"]:
@@ -1343,6 +1398,14 @@ def main():
     if os.geteuid() != 0:
         log_error("This script must be run as root (with sudo).")
         return 1
+    
+    # Check if CPU is AMD
+    if not check_cpu_vendor():
+        log_warning("This script is designed for AMD CPUs. Proceed with caution.")
+        proceed = input("Continue anyway? (y/n): ").lower()
+        if proceed != 'y':
+            log_info("Setup canceled due to CPU vendor mismatch.")
+            return 0
     
     # Gather all system information
     system_info = gather_system_info()
