@@ -582,9 +582,12 @@ def configure_kernel_parameters(dry_run=False, debug=False):
     
     parameters = match.group(1).split()
     
+    # Determine appropriate IOMMU parameter based on CPU vendor
+    is_amd = check_cpu_vendor()
+    
     # Add required parameters if not already present
     required_params = [
-        "amd_iommu=on",  # AMD CPU
+        "amd_iommu=on" if is_amd else "intel_iommu=on",  # Choose based on CPU vendor
         "iommu=pt",      # IOMMU passthrough mode (most efficient for VM passthrough)
         "rd.driver.pre=vfio-pci",  # Force vfio-pci to load very early in initramfs
         # Note: rd.driver.pre=vfio-pci is generally needed for proper GPU passthrough,
@@ -994,6 +997,14 @@ def create_cleanup_script(changes, dry_run=False, debug=False):
             script_content += "else\n"
             script_content += f"  echo 'BTRFS snapshot at {change['item']} no longer exists'\n"
             script_content += "fi\n\n"
+    
+    # Add note about package installations
+    script_content += "# Note about package installations\n"
+    script_content += "echo \"\"\n"
+    script_content += "echo \"Note: If virtualization software (libvirt, qemu, virt-manager) was installed,\"\n"
+    script_content += "echo \"this cleanup script does not automatically remove it. You may need to\"\n"
+    script_content += "echo \"uninstall these packages manually if desired.\"\n"
+    script_content += "echo \"\"\n"
     
     script_content += "echo 'VFIO cleanup complete. Please reboot your system for changes to take effect.'\n"
     
@@ -1428,13 +1439,18 @@ def main():
         # Verify setup
         verify_setup(system_info, args.dry_run)
         
+        # Get the definite path to the cleanup script
+        cleanup_script_path = os.path.join(SCRIPT_DIR, "vfio_cleanup.sh")
+        
         print(f"{Colors.BOLD}{'=' * 80}{Colors.ENDC}")
         if args.dry_run:
             log_success("[DRY RUN] VFIO GPU passthrough setup simulation complete!")
             log_info("Run without --dry-run to make actual changes.")
         else:
             log_success("VFIO GPU passthrough setup complete!")
-            log_info(f"To revert all changes, run: sudo python3 {os.path.basename(__file__)} --cleanup")
+            log_info(f"To revert all changes, you can run the generated cleanup script:")
+            log_info(f"  sudo bash {cleanup_script_path}")
+            log_info(f"(Alternatively, run: sudo python3 {os.path.basename(__file__)} --cleanup --output-dir '{SCRIPT_DIR}')")
             log_info("Please reboot your system for the changes to take effect.")
         
         log_info("After reboot, verify that the AMD GPU is bound to the vfio-pci driver with:")
