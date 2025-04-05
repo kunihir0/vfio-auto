@@ -108,6 +108,17 @@ def detect_bootloader():
     
     # Check for systemd-boot
     if os.path.exists('/boot/efi/loader/loader.conf') or os.path.exists('/boot/loader/loader.conf'):
+        # Check specifically for Pop!_OS (which uses systemd-boot)
+        if os.path.exists('/etc/pop-os/os-release') or os.path.exists('/usr/lib/os-release'):
+            # Verify it's Pop!_OS by checking content
+            release_file = '/etc/pop-os/os-release' if os.path.exists('/etc/pop-os/os-release') else '/usr/lib/os-release'
+            try:
+                with open(release_file, 'r') as f:
+                    content = f.read()
+                    if 'Pop!_OS' in content:
+                        return "systemd-boot-popos"
+            except:
+                pass
         return "systemd-boot"
     
     # Check for LILO
@@ -123,7 +134,7 @@ def check_dependencies():
     
     required_commands = [
         "lspci", "grep", "awk", "find", "mkdir", "cp", "chmod",
-        "cat", "ls", "df", "test"
+        "cat", "ls", "df", "test", "uname"
     ]
     
     # Check for bootloader/initramfs update commands based on the actual bootloader
@@ -653,139 +664,292 @@ def configure_vfio_modules(device_ids, dry_run=False, debug=False):
     return True
 
 
-def detect_bootloader():
-    """Detect the bootloader used by the system."""
-    # Check for GRUB
-    if os.path.exists('/etc/default/grub'):
-        if os.path.exists('/usr/sbin/update-grub'):
-            return "grub-debian"  # Debian/Ubuntu style
-        elif os.path.exists('/usr/sbin/grub2-mkconfig'):
-            return "grub-fedora"  # Fedora/RHEL style
-        elif os.path.exists('/usr/sbin/grub-mkconfig'):
-            return "grub-arch"    # Arch style
+def get_current_kernel_info():
+    """Get information about the current kernel."""
+    log_info("Getting current kernel information...")
+    
+    # Get current kernel version
+    kernel_version = run_command("uname -r")
+    if not kernel_version:
+        log_error("Failed to determine current kernel version.")
+        return None
+    
+    # Find kernel and initrd files
+    kernel_path = f"/boot/vmlinuz-{kernel_version}"
+    initrd_path = f"/boot/initrd.img-{kernel_version}"
+    
+    # Check if files exist
+    if not os.path.exists(kernel_path):
+        # Try alternative locations
+        alternatives = [
+            f"/boot/vmlinuz-{kernel_version}",
+            f"/boot/vmlinux-{kernel_version}",
+            f"/boot/kernel-{kernel_version}"
+        ]
+        for alt in alternatives:
+            if os.path.exists(alt):
+                kernel_path = alt
+                break
         else:
-            return "grub-unknown"
+            log_error(f"Could not find kernel image for version {kernel_version}")
+            return None
     
-    # Check for systemd-boot
-    if os.path.exists('/boot/efi/loader/loader.conf') or os.path.exists('/boot/loader/loader.conf'):
-        return "systemd-boot"
+    if not os.path.exists(initrd_path):
+        # Try alternative locations and names
+        alternatives = [
+            f"/boot/initrd.img-{kernel_version}",
+            f"/boot/initramfs-{kernel_version}.img",
+            f"/boot/initrd-{kernel_version}.img"
+        ]
+        for alt in alternatives:
+            if os.path.exists(alt):
+                initrd_path = alt
+                break
+        else:
+            log_error(f"Could not find initrd image for version {kernel_version}")
+            return None
     
-    # Check for LILO
-    if os.path.exists('/etc/lilo.conf'):
-        return "lilo"
+    # Get root filesystem information
+    root_info = run_command("findmnt -n -o SOURCE,UUID --target /")
+    if not root_info:
+        log_warning("Could not determine root filesystem information.")
+        root_param = "root=LABEL=/"  # Fallback
+    else:
+        parts = root_info.split()
+        if len(parts) >= 2:
+            root_param = f"root=UUID={parts[1]}"
+        else:
+            root_param = f"root={parts[0]}"
     
-    return "unknown"
+    return {
+        "version": kernel_version,
+        "kernel_path": kernel_path,
+        "initrd_path": initrd_path,
+        "root_param": root_param,
+    }
+
+def get_grub_cmdline_params():
+    """Extract current parameters from GRUB_CMDLINE_LINUX_DEFAULT."""
+    grub_path = '/etc/default/grub'
+    if not os.path.exists(grub_path):
+        log_warning(f"{grub_path} not found. Using default parameters.")
+        return "quiet splash"
+    
+    with open(grub_path, 'r') as f:
+        grub_content = f.read()
+    
+    # Find the GRUB_CMDLINE_LINUX_DEFAULT line
+    match = re.search(r'GRUB_CMDLINE_LINUX_DEFAULT="([^"]*)"', grub_content)
+    if not match:
+        log_warning("Could not find GRUB_CMDLINE_LINUX_DEFAULT in GRUB configuration.")
+        return "quiet splash"
+    
+    return match.group(1)
+
+def create_custom_grub_entry(is_amd=True, dry_run=False, debug=False):
+    """Create a custom GRUB entry for VFIO passthrough."""
+    log_info("Creating custom GRUB entry for VFIO passthrough...")
+    
+    # Get current kernel information
+    kernel_info = get_current_kernel_info()
+    if not kernel_info:
+        log_error("Failed to get current kernel information.")
+        return False
+    
+    # Get base parameters from GRUB_CMDLINE_LINUX_DEFAULT
+    base_params = get_grub_cmdline_params()
+    
+    # Prepare VFIO parameters based on CPU
+    iommu_param = "amd_iommu=on" if is_amd else "intel_iommu=on"
+    vfio_params = f"{iommu_param} iommu=pt rd.driver.pre=vfio-pci"
+    
+    # Combine parameters, avoiding duplicates
+    base_param_list = base_params.split()
+    # Remove any existing IOMMU params from base params
+    base_param_list = [p for p in base_param_list if not p.startswith(("amd_iommu=", "intel_iommu=", "iommu=", "rd.driver.pre="))]
+    all_params = " ".join(base_param_list + vfio_params.split())
+    
+    # Create the menuentry
+    menuentry = f"""
+# BEGIN VFIO Passthrough Entry (Added by vfio.py script)
+menuentry 'Linux with VFIO GPU Passthrough (Kernel {kernel_info["version"]})' --class ubuntu --class gnu-linux --class gnu --class os $menuentry_id_option 'gnulinux-simple-vfio' {{
+    # Load video drivers early
+    insmod all_video
+    
+    # Set gfxpayload
+    gfxpayload=keep
+    
+    # Linux kernel and initrd
+    linux {kernel_info["kernel_path"]} {kernel_info["root_param"]} ro {all_params}
+    initrd {kernel_info["initrd_path"]}
+}}
+# END VFIO Passthrough Entry
+"""
+    
+    # Path to 40_custom
+    custom_grub_path = '/etc/grub.d/40_custom'
+    
+    if dry_run:
+        log_debug(f"Would append to {custom_grub_path}:", debug)
+        log_debug(f"Content: {menuentry}", debug)
+        log_success("[DRY RUN] Custom GRUB entry would be created")
+        return True
+    
+    # Create backup of existing file if it exists
+    backup_path = None
+    if os.path.exists(custom_grub_path):
+        backup_path = create_timestamped_backup(custom_grub_path, dry_run, debug)
+        if not backup_path:
+            log_error(f"Failed to create backup of {custom_grub_path}")
+            return False
+    
+    # Check if our entry already exists
+    existing_entry = False
+    if os.path.exists(custom_grub_path):
+        with open(custom_grub_path, 'r') as f:
+            content = f.read()
+            if "BEGIN VFIO Passthrough Entry" in content:
+                existing_entry = True
+                log_warning("A VFIO entry already exists in the custom GRUB configuration.")
+                log_warning("The existing entry will be replaced.")
+                
+                # Remove existing entry
+                new_content = re.sub(
+                    r'# BEGIN VFIO Passthrough Entry.*?# END VFIO Passthrough Entry\n?',
+                    '',
+                    content,
+                    flags=re.DOTALL
+                )
+                
+                with open(custom_grub_path, 'w') as f:
+                    f.write(new_content)
+    
+    # Append the menuentry to 40_custom
+    mode = 'a' if os.path.exists(custom_grub_path) else 'w'
+    with open(custom_grub_path, 'a') as f:
+        f.write(menuentry)
+    
+    # Make sure it's executable
+    os.chmod(custom_grub_path, 0o755)
+    
+    log_success(f"{'Updated' if existing_entry else 'Created'} custom GRUB entry in {custom_grub_path}")
+    
+    return True
+
+def configure_kernel_parameters_popos(is_amd=True, dry_run=False, debug=False):
+    """Configure kernel parameters for IOMMU and VFIO using kernelstub on Pop!_OS."""
+    log_info("Configuring kernel parameters for Pop!_OS using kernelstub...")
+    
+    # Check if kernelstub is available
+    if not shutil.which("kernelstub"):
+        log_error("kernelstub command not found. Cannot configure kernel parameters on Pop!_OS.")
+        return False
+    
+    # Define required parameters
+    iommu_param = "amd_iommu=on" if is_amd else "intel_iommu=on"
+    required_params = [iommu_param, "iommu=pt", "rd.driver.pre=vfio-pci"]
+    
+    # Get current parameters
+    current_params_output = run_command("kernelstub -p", dry_run, debug)
+    if not current_params_output and not dry_run:
+        log_error("Failed to get current kernel parameters with kernelstub -p")
+        return False
+    
+    # Parse current parameters
+    current_params = []
+    if current_params_output:
+        # Try to extract parameters from kernelstub -p output
+        match = re.search(r'user parameters:(.*?)$', current_params_output, re.MULTILINE | re.DOTALL)
+        if match:
+            params_str = match.group(1).strip()
+            if params_str:
+                # Remove brackets and split by commas
+                params_str = params_str.strip('[]').strip()
+                if params_str:
+                    current_params = [p.strip().strip('"\'') for p in params_str.split(',')]
+    
+    # Track which parameters we added
+    added_params = []
+    
+    if dry_run:
+        log_debug("Current kernel parameters:", debug)
+        for param in current_params:
+            log_debug(f"  {param}", debug)
+        
+        log_debug("Parameters to add:", debug)
+        for param in required_params:
+            if not any(p.startswith(param.split('=')[0]) for p in current_params):
+                log_debug(f"  {param} (would be added)", debug)
+                added_params.append(param)
+            else:
+                log_debug(f"  {param} (already exists)", debug)
+        
+        log_success("[DRY RUN] Kernel parameters would be configured using kernelstub")
+        return added_params
+    
+    # Add missing parameters
+    for param in required_params:
+        # Check if parameter or one with same prefix already exists
+        param_name = param.split('=')[0]
+        if not any(p.startswith(param_name) for p in current_params):
+            log_info(f"Adding kernel parameter: {param}")
+            result = run_command(f"kernelstub -a {param}", dry_run, debug)
+            if result is not None:
+                log_success(f"Added kernel parameter: {param}")
+                added_params.append(param)
+            else:
+                log_error(f"Failed to add kernel parameter: {param}")
+        else:
+            log_info(f"Kernel parameter already exists: {param_name}...")
+    
+    if added_params:
+        log_success(f"Added {len(added_params)} kernel parameters with kernelstub")
+    else:
+        log_info("No new kernel parameters needed to be added")
+    
+    return added_params
 
 
 def configure_kernel_parameters(dry_run=False, debug=False):
-    """Configure kernel parameters for IOMMU and VFIO."""
+    """Configure kernel parameters for IOMMU and VFIO using the appropriate method for the detected bootloader."""
     log_info("Configuring kernel parameters...")
     
     # Detect bootloader
     bootloader = detect_bootloader()
     log_info(f"Detected bootloader: {bootloader}")
     
-    if "grub" not in bootloader:
-        log_warning(f"This script primarily supports GRUB bootloader. Detected: {bootloader}")
-        log_warning("You may need to manually configure your bootloader with these parameters:")
-        log_warning("  amd_iommu=on iommu=pt rd.driver.pre=vfio-pci")
-        
-        # For systemd-boot, provide additional guidance
-        if bootloader == "systemd-boot":
-            log_info("For systemd-boot, you need to edit/create entries in /boot/loader/entries/")
-            log_info("Add the kernel parameters to the 'options' line in your entry file.")
-        
-        response = input("Continue anyway? (y/n): ").lower()
-        if response != 'y':
-            return False
-    
-    grub_path = '/etc/default/grub'
-    
-    if not os.path.exists(grub_path):
-        log_error(f"{grub_path} not found. Your system might not use GRUB.")
-        return False
-    
-    # Read current GRUB configuration
-    with open(grub_path, 'r') as f:
-        grub_content = f.readlines()
-    
-    # Find the GRUB_CMDLINE_LINUX_DEFAULT line
-    cmdline_line_index = None
-    for i, line in enumerate(grub_content):
-        if line.startswith('GRUB_CMDLINE_LINUX_DEFAULT='):
-            cmdline_line_index = i
-            break
-    
-    if cmdline_line_index is None:
-        log_error("Could not find GRUB_CMDLINE_LINUX_DEFAULT line in GRUB configuration.")
-        return False
-    
-    # Get current parameters
-    line = grub_content[cmdline_line_index]
-    match = re.match(r'GRUB_CMDLINE_LINUX_DEFAULT="([^"]*)"', line)
-    if not match:
-        log_error(f"Unexpected format in GRUB configuration: {line}")
-        return False
-    
-    parameters = match.group(1).split()
-    
     # Determine appropriate IOMMU parameter based on CPU vendor
     is_amd = check_cpu_vendor()
     
-    # Add required parameters if not already present
-    required_params = [
-        "amd_iommu=on" if is_amd else "intel_iommu=on",  # Choose based on CPU vendor
-        "iommu=pt",      # IOMMU passthrough mode (most efficient for VM passthrough)
-        "rd.driver.pre=vfio-pci",  # Force vfio-pci to load very early in initramfs
-        # Note: rd.driver.pre=vfio-pci is generally needed for proper GPU passthrough,
-        # but some modern dracut configurations might handle this automatically
-    ]
-    
-    # Ask for advanced parameters if in debug mode
-    if debug:
-        print("\nAdvanced IOMMU configuration options:")
-        print("1. iommu=pt (passthrough mode, recommended for best performance)")
-        print("2. iommu=on (default mode, may be more compatible with some systems)")
-        advanced_choice = input("Choose IOMMU mode (1/2) [default=1]: ")
+    # Handle based on bootloader type
+    if "grub" in bootloader:
+        # Create custom GRUB entry using the existing method
+        if not create_custom_grub_entry(is_amd, dry_run, debug):
+            log_error("Failed to create custom GRUB entry.")
+            return False
         
-        if advanced_choice == "2":
-            # Replace iommu=pt with iommu=on in required params
-            required_params = [p if not p.startswith("iommu=") else "iommu=on" for p in required_params]
-    
-    # Check which parameters need to be added
-    params_to_add = []
-    for param in required_params:
-        param_name = param.split('=')[0]
-        existing_param = next((p for p in parameters if p.startswith(f"{param_name}=")), None)
-        if existing_param:
-            # Parameter exists, check if it needs to be updated
-            if existing_param != param:
-                parameters.remove(existing_param)
-                params_to_add.append(param)
-        else:
-            params_to_add.append(param)
-    
-    # If no parameters need to be added, we're done
-    if not params_to_add:
-        log_success("Required kernel parameters are already configured.")
-        return True
-    
-    # Add the parameters
-    parameters.extend(params_to_add)
-    
-    # Create the final parameter string for display/non-GRUB users
-    final_params_string = " ".join(parameters)
-    
-    # For non-GRUB bootloaders, provide the exact string to copy-paste
-    if "grub" not in bootloader:
-        log_info(f"The required kernel options line is: {final_params_string}")
-    
-    if dry_run:
-        log_debug(f"Would update GRUB configuration in {grub_path}", debug)
-        log_debug(f"New parameters: {params_to_add}", debug)
-        log_debug(f"New GRUB_CMDLINE_LINUX_DEFAULT value: {final_params_string}", debug)
-        
+        # Run appropriate update-grub command
         grub_update_command = None
+        
+        if dry_run:
+            # Determine which command would be used
+            if os.path.exists('/usr/sbin/update-grub'):
+                grub_update_command = 'update-grub'
+            elif os.path.exists('/usr/sbin/grub2-mkconfig'):
+                grub_update_command = 'grub2-mkconfig -o /boot/grub2/grub.cfg'
+            elif os.path.exists('/usr/sbin/grub-mkconfig'):
+                if os.path.exists('/boot/grub/grub.cfg'):
+                    grub_update_command = 'grub-mkconfig -o /boot/grub/grub.cfg'
+                elif os.path.exists('/boot/grub2/grub.cfg'):
+                    grub_update_command = 'grub-mkconfig -o /boot/grub2/grub.cfg'
+            
+            if grub_update_command:
+                log_debug(f"Would run GRUB update command: {grub_update_command}", debug)
+            
+            log_success("[DRY RUN] GRUB configuration would be updated")
+            return True
+        
+        # Determine the correct update-grub command
         if os.path.exists('/usr/sbin/update-grub'):
             grub_update_command = 'update-grub'
         elif os.path.exists('/usr/sbin/grub2-mkconfig'):
@@ -796,60 +960,40 @@ def configure_kernel_parameters(dry_run=False, debug=False):
             elif os.path.exists('/boot/grub2/grub.cfg'):
                 grub_update_command = 'grub-mkconfig -o /boot/grub2/grub.cfg'
         
-        if grub_update_command:
-            log_debug(f"Would run GRUB update command: {grub_update_command}", debug)
+        if not grub_update_command:
+            log_error("Could not find a suitable command to update GRUB.")
+            log_warning("Please update your GRUB configuration manually.")
+            return False
         
-        log_success("[DRY RUN] GRUB configuration would be updated")
-        return True
+        log_info(f"Updating GRUB configuration with command: {grub_update_command}")
+        result = run_command(grub_update_command)
+        
+        if result:
+            log_success("GRUB configuration updated successfully.")
+            return True
+        else:
+            log_error("Failed to update GRUB configuration.")
+            log_error("Please update your bootloader configuration manually.")
+            return False
     
-    # Create backup of the original file
-    backup_path = create_timestamped_backup(grub_path, dry_run, debug)
-    if not backup_path and not dry_run:
-        log_error("Failed to create backup, aborting GRUB configuration update for safety")
-        return False
+    elif "systemd-boot" in bootloader:
+        # Use kernelstub for Pop!_OS or other systemd-boot systems
+        added_params = configure_kernel_parameters_popos(is_amd, dry_run, debug)
+        if added_params or added_params == []:  # Empty list means no params needed to be added
+            return {"added_params": added_params, "bootloader": bootloader}
+        else:
+            log_error("Failed to configure kernel parameters using kernelstub.")
+            return False
     
-    # Update the GRUB configuration
-    grub_content[cmdline_line_index] = f'GRUB_CMDLINE_LINUX_DEFAULT="{final_params_string}"\n'
-    
-    try:
-        with open(grub_path, 'w') as f:
-            f.writelines(grub_content)
-    except Exception as e:
-        log_error(f"Failed to update GRUB configuration: {str(e)}")
-        log_error(f"You can restore from the backup: {backup_path}")
-        return False
-    
-    log_success(f"Updated GRUB configuration with parameters: {', '.join(params_to_add)}")
-    
-    grub_update_command = None
-    
-    # Determine the correct update-grub command
-    if os.path.exists('/usr/sbin/update-grub'):
-        grub_update_command = 'update-grub'
-    elif os.path.exists('/usr/sbin/grub2-mkconfig'):
-        grub_update_command = 'grub2-mkconfig -o /boot/grub2/grub.cfg'
-    elif os.path.exists('/usr/sbin/grub-mkconfig'):
-        if os.path.exists('/boot/grub/grub.cfg'):
-            grub_update_command = 'grub-mkconfig -o /boot/grub/grub.cfg'
-        elif os.path.exists('/boot/grub2/grub.cfg'):
-            grub_update_command = 'grub-mkconfig -o /boot/grub2/grub.cfg'
-    
-    if not grub_update_command:
-        log_error("Could not find a suitable command to update GRUB.")
-        log_warning("Please update your GRUB configuration manually.")
-        return False
-    
-    log_info(f"Updating GRUB configuration with command: {grub_update_command}")
-    result = run_command(grub_update_command)
-    
-    if result:
-        log_success("GRUB configuration updated successfully.")
-        return True
     else:
-        log_error("Failed to update GRUB configuration.")
-        log_error(f"You can restore from the backup: {backup_path}")
-        log_error("After restoring, manually update your bootloader configuration.")
-        return False
+        log_warning(f"Unsupported bootloader: {bootloader}")
+        log_warning("You need to manually configure your bootloader with these parameters:")
+        log_warning(f"  {'amd' if is_amd else 'intel'}_iommu=on iommu=pt rd.driver.pre=vfio-pci")
+        
+        response = input("Continue anyway? (y/n): ").lower()
+        if response != 'y':
+            return False
+        return True
 
 
 def update_initramfs(dry_run=False, debug=False):
@@ -1073,8 +1217,8 @@ def create_cleanup_script(changes, dry_run=False, debug=False):
                 # Find the most recent backup
                 if "backup_path" in change:
                     backup_path = change["backup_path"]
-                    script_content += f"if [ -f '{backup_path}' ]; then\n"
-                    script_content += f"  if [ -f '{change['item']}' ]; then\n"
+                    script_content += f"if [ -f '{backup_path}']; then\n"
+                    script_content += f"  if [ -f '{change['item']}']; then\n"
                     script_content += f"    echo 'Checking if {change['item']} needs restoration...'\n"
                     script_content += f"    if ! cmp -s '{change['item']}' '{backup_path}'; then\n"
                     script_content += f"      echo 'Restoring {change['item']} from {backup_path}'\n"
@@ -1089,6 +1233,40 @@ def create_cleanup_script(changes, dry_run=False, debug=False):
                     script_content += "else\n"
                     script_content += f"  echo 'Warning: Backup {backup_path} not found, cannot restore {change['item']}'\n"
                     script_content += "fi\n\n"
+    
+    # Add cleanup for kernelstub parameters (for Pop!_OS)
+    if "kernelstub" in changes:
+        script_content += "# Remove kernel parameters added by kernelstub\n"
+        for change in changes["kernelstub"]:
+            if change["item"] == "added_params" and isinstance(change["content"], list):
+                for param in change["content"]:
+                    script_content += f"if command -v kernelstub >/dev/null 2>&1; then\n"
+                    script_content += f"  echo 'Removing kernel parameter: {param}'\n"
+                    script_content += f"  if ! kernelstub -d \"{param}\"; then\n"
+                    script_content += f"    echo 'Warning: Failed to remove kernel parameter {param}'\n"
+                    script_content += "  fi\n"
+                    script_content += "else\n"
+                    script_content += "  echo 'kernelstub not found. Cannot remove kernel parameters.'\n"
+                    script_content += "  echo 'You may need to remove them manually.'\n"
+                    script_content += "fi\n\n"
+    
+    # Add specific cleanup for custom GRUB entry
+    custom_grub_path = '/etc/grub.d/40_custom'
+    bootloader = detect_bootloader()
+    
+    if "grub" in bootloader:
+        script_content += "# Remove VFIO GRUB entry if it exists\n"
+        script_content += f"if [ -f '{custom_grub_path}' ]; then\n"
+        script_content += f"  echo 'Checking for VFIO entry in {custom_grub_path}...'\n"
+        script_content += f"  if grep -q 'BEGIN VFIO Passthrough Entry' '{custom_grub_path}'; then\n"
+        script_content += f"    echo 'Removing VFIO entry from {custom_grub_path}'\n"
+        script_content += f"    sed -i '/# BEGIN VFIO Passthrough Entry/,/# END VFIO Passthrough Entry/d' '{custom_grub_path}'\n"
+        script_content += "  else\n"
+        script_content += f"    echo 'No VFIO entry found in {custom_grub_path}'\n"
+        script_content += "  fi\n"
+        script_content += "else\n"
+        script_content += f"  echo 'Custom GRUB file {custom_grub_path} not found'\n"
+        script_content += "fi\n\n"
     
     # Handle initramfs updates
     if "initramfs" in changes:
@@ -1106,7 +1284,7 @@ def create_cleanup_script(changes, dry_run=False, debug=False):
             script_content += "fi\n\n"
     
     # Handle GRUB updates
-    if "grub" in changes:
+    if "grub" in changes or True:  # Always update GRUB to remove our custom entry
         script_content += "# Updating GRUB after reverting changes\n"
         script_content += "echo 'Updating bootloader configuration...'\n"
         if os.path.exists('/usr/sbin/update-grub'):
@@ -1342,10 +1520,12 @@ def interactive_setup(system_info, dry_run=False, debug=False):
         response = input("IOMMU is not properly enabled. Configure kernel parameters? (y/n): ").lower()
         if response == 'y':
             # Backup grub file before modification
+            bootloader = detect_bootloader()
             grub_path = '/etc/default/grub'
             backup_path = None
             
-            if os.path.exists(grub_path):
+            # Only backup GRUB if we're using GRUB bootloader
+            if "grub" in bootloader and os.path.exists(grub_path):
                 backup_path = create_timestamped_backup(grub_path, dry_run, debug)
                 if backup_path:
                     changes = track_change(changes, "files", grub_path, "modified")
@@ -1356,8 +1536,14 @@ def interactive_setup(system_info, dry_run=False, debug=False):
                                 c["backup_path"] = backup_path
                                 break
             
-            if configure_kernel_parameters(dry_run, debug):
-                changes = track_change(changes, "grub", "updated", "IOMMU parameters added")
+            result = configure_kernel_parameters(dry_run, debug)
+            if result:
+                if isinstance(result, dict) and "bootloader" in result and "systemd-boot" in result["bootloader"]:
+                    # Track kernelstub changes for Pop!_OS
+                    changes = track_change(changes, "kernelstub", "added_params", result.get("added_params", []))
+                else:
+                    # Track GRUB changes
+                    changes = track_change(changes, "grub", "updated", "IOMMU parameters added")
                 log_success("Kernel parameters configured successfully.")
             else:
                 log_error("Failed to configure kernel parameters.")
