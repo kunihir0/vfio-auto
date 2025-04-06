@@ -252,10 +252,16 @@ def check_cpu_virtualization():
     """Check if CPU virtualization is enabled."""
     log_info("Checking CPU virtualization...")
     
-    # Check for AMD-V
+    # Get CPU vendor first to properly report virtualization type
+    is_amd = False
+    vendor_id = run_command("grep -m1 'vendor_id' /proc/cpuinfo | awk '{print $3}'")
+    if vendor_id == "AuthenticAMD":
+        is_amd = True
+    
+    # Check for AMD-V (svm) or Intel VT-x (vmx)
     output = run_command("grep -m1 -o 'svm\\|vmx' /proc/cpuinfo")
     if output:
-        virt_type = "AMD-V" if output == "svm" else "Intel VT-x"
+        virt_type = "AMD-V" if output == "svm" or is_amd else "Intel VT-x"
         log_success(f"{virt_type} virtualization is available.")
         return True
     else:
@@ -384,14 +390,19 @@ def get_gpus():
                 current_gpu = {}
             
             # Extract BDF address, vendor, device, and description
-            match = re.match(r'^(\S+).*\[(\w+):(\w+)\](.*)$', line)
+            # Corrected Regex: Capture description before the final IDs
+            match = re.match(r'^(\S+)\s+(.+?)\s+\[(\w+):(\w+)\](?:.*)?$', line)
             if match:
-                bdf, vendor_id, device_id, description = match.groups()
+                bdf = match.group(1).strip()
+                description = match.group(2).strip()  # Group 2 is now the description
+                vendor_id = match.group(3)
+                device_id = match.group(4)
+                
                 current_gpu = {
-                    'bdf': bdf.strip(),
+                    'bdf': bdf,
                     'vendor_id': vendor_id,
                     'device_id': device_id,
-                    'description': description.strip(),
+                    'description': description,
                 }
                 
                 # Identify GPU vendor
@@ -529,6 +540,32 @@ def get_iommu_groups():
     return iommu_groups
 
 
+def find_gpu_audio_device(gpu, iommu_groups):
+    """Find the audio device associated with a GPU."""
+    # Extract the base address without the function number (last digit after dot)
+    if 'bdf' not in gpu:
+        return None
+    
+    # The GPU BDF is typically x:xx.0, and its audio device is typically x:xx.1
+    gpu_base = gpu['bdf'].rsplit('.', 1)[0]
+    expected_audio_bdf = f"{gpu_base}.1"
+    
+    # Search through all IOMMU groups for the audio device
+    audio_device = None
+    audio_group = None
+    
+    for group_id, devices in iommu_groups.items():
+        for device in devices:
+            if device['bdf'] == expected_audio_bdf:
+                audio_device = device
+                audio_group = group_id
+                break
+        if audio_device:
+            break
+    
+    return audio_device, audio_group
+
+
 def find_gpu_iommu_group(gpu, iommu_groups):
     """Find the IOMMU group for a GPU and all related devices."""
     log_info(f"Finding IOMMU group for GPU at {gpu['bdf']}...")
@@ -554,6 +591,20 @@ def find_gpu_iommu_group(gpu, iommu_groups):
     for device in gpu_group_devices:
         log_info(f"  {device['description']}")
     
+    # Check for GPU audio device
+    audio_device, audio_group = find_gpu_audio_device(gpu, iommu_groups)
+    
+    if audio_device:
+        if audio_group == gpu_group:
+            log_success(f"GPU audio device found in the same IOMMU group: {audio_device['description']}")
+        else:
+            log_warning(f"GPU audio device found in different IOMMU group {audio_group}: {audio_device['description']}")
+            log_warning("This may cause issues with audio passthrough. Ideally, both devices should be in the same group.")
+    else:
+        log_warning(f"No audio device found for GPU at {gpu['bdf']}.")
+        log_warning("This may cause issues with audio over HDMI/DisplayPort in the VM.")
+        log_warning("Check if your GPU has an audio component with: lspci | grep -i audio")
+    
     # Add warning about IOMMU group implications
     log_warning("All devices in this IOMMU group will be bound to vfio-pci driver")
     log_warning("This means they will be unavailable to the host system")
@@ -576,6 +627,26 @@ def get_device_ids(devices):
                 ids.append(id_pair)
     
     return ids
+
+
+def get_all_gpu_related_devices(gpu, iommu_groups):
+    """Get all devices related to a GPU across all IOMMU groups."""
+    related_devices = []
+    
+    # Get the base address without the function number
+    if 'bdf' not in gpu:
+        return related_devices
+    
+    gpu_base = gpu['bdf'].rsplit('.', 1)[0]
+    
+    # Search all groups for devices with the same base address
+    for group_id, devices in iommu_groups.items():
+        for device in devices:
+            device_base = device['bdf'].rsplit('.', 1)[0]
+            if device_base == gpu_base:
+                related_devices.append((device, group_id))
+    
+    return related_devices
 
 
 def create_timestamped_backup(file_path, dry_run=False, debug=False):
@@ -1412,8 +1483,21 @@ def gather_system_info():
                 system_info["gpu_iommu_group"] = gpu_group
                 system_info["gpu_group_devices"] = gpu_group_devices
                 
+                # Find all related devices across all IOMMU groups
+                related_devices = get_all_gpu_related_devices(system_info["gpu_for_passthrough"], iommu_groups)
+                system_info["gpu_related_devices"] = related_devices
+                
                 if gpu_group_devices:
                     system_info["device_ids"] = get_device_ids(gpu_group_devices)
+                    
+                    # Add any related devices from other groups if they exist
+                    for device, group_id in related_devices:
+                        if group_id != gpu_group:
+                            device_ids = get_device_ids([device])
+                            for device_id in device_ids:
+                                if device_id not in system_info["device_ids"]:
+                                    system_info["device_ids"].append(device_id)
+                                    log_warning(f"Adding device from separate IOMMU group {group_id}: {device['description']}")
     
     return system_info
 
