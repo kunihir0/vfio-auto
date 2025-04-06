@@ -366,7 +366,8 @@ def get_gpus():
     log_info("Identifying GPUs in the system...")
     
     # Get all PCI devices
-    lspci_output = run_command("lspci -nnk | grep -A3 'VGA\\|Display'")
+    # Use grep -E for Extended Regular Expressions, where | means OR directly
+    lspci_output = run_command("lspci -nnk | grep -E -A3 'VGA|Display'")
     
     if not lspci_output:
         log_error("No GPUs detected in the system.")
@@ -1207,7 +1208,7 @@ def create_cleanup_script(changes, dry_run=False, debug=False):
         for change in changes["files"]:
             # Find the most recent backup before our changes
             if change["content"] == "created":
-                script_content += f"if [ -f '{change['item']}' ]; then\n"
+                script_content += f"if [ -f '{change['item']}']; then\n"
                 script_content += f"  echo 'Removing file {change['item']}'\n"
                 script_content += f"  rm -f '{change['item']}'\n"
                 script_content += "else\n"
@@ -1256,7 +1257,7 @@ def create_cleanup_script(changes, dry_run=False, debug=False):
     
     if "grub" in bootloader:
         script_content += "# Remove VFIO GRUB entry if it exists\n"
-        script_content += f"if [ -f '{custom_grub_path}' ]; then\n"
+        script_content += f"if [ -f '{custom_grub_path}']; then\n"
         script_content += f"  echo 'Checking for VFIO entry in {custom_grub_path}...'\n"
         script_content += f"  if grep -q 'BEGIN VFIO Passthrough Entry' '{custom_grub_path}'; then\n"
         script_content += f"    echo 'Removing VFIO entry from {custom_grub_path}'\n"
@@ -1313,7 +1314,7 @@ def create_cleanup_script(changes, dry_run=False, debug=False):
     if "btrfs" in changes:
         script_content += "# Note about BTRFS snapshot\n"
         for change in changes["btrfs"]:
-            script_content += f"if [ -d '{change['item']}' ]; then\n"
+            script_content += f"if [ -d '{change['item']}']; then\n"
             script_content += f"  echo 'A BTRFS snapshot was created at {change['item']}'\n"
             script_content += "  echo 'You can manually restore from this snapshot with:'\n"
             script_content += f"  echo \"  sudo btrfs subvolume snapshot {change['item']} /\"\n"
@@ -1707,6 +1708,8 @@ def verify_setup(system_info, dry_run=False):
 
 def main():
     """Main function to run the VFIO setup."""
+    global SCRIPT_DIR  # Move global declaration to the top of the function
+    
     parser = argparse.ArgumentParser(description='VFIO GPU Passthrough Setup Script')
     parser.add_argument('--dry-run', action='store_true', help='Simulate all operations without making actual changes')
     parser.add_argument('--debug', action='store_true', help='Enable verbose debug output')
@@ -1716,7 +1719,6 @@ def main():
     args = parser.parse_args()
     
     # Update script dir if output-dir is specified
-    global SCRIPT_DIR
     if args.output_dir != SCRIPT_DIR:
         if os.path.isdir(args.output_dir):
             SCRIPT_DIR = args.output_dir

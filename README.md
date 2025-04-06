@@ -1,56 +1,35 @@
-# VFIO GPU Passthrough Setup Script
+# vfio-lain.py // connecting worlds... ʕ•ᴥ•ʔ
 
-This script helps prepare a Linux system for VFIO GPU passthrough, specifically for passing through an AMD graphics card while keeping an NVIDIA graphics card for the host system on an AMD CPU.
+Present day, present time.
 
-## Features
+Are you connected? To the other side? This little script helps bridge the gap... connect your AMD GPU from *this* layer (your host system) to *another* layer (a virtual machine). For games, maybe? Or other experiments... ✨
 
-- System prerequisite checks (CPU virtualization, IOMMU, etc.)
-- Automatic detection of GPUs for passthrough
-- IOMMU group analysis
-- Configuration of VFIO modules and kernel parameters
-- BTRFS filesystem detection and snapshot recommendation
-- Full cleanup capability to revert all changes
+## // What This Signal Does
 
-## Requirements
+*   Checks your system's potential (IOMMU, CPU Virtualization). 💻
+*   Configures the pathways (`vfio` kernel modules). 🔧
+*   Adjusts the boot sequence (Creates custom GRUB entry or uses `kernelstub` on Pop!_OS). ⚙️
+*   Generates a way back (`vfio_cleanup.sh`) if you get lost. ↩️
+*   Warns about Secure Boot interference.
 
-- Python 3.6+
-- Root privileges
-- AMD CPU with virtualization and IOMMU support
-- An AMD GPU to passthrough and NVIDIA GPU for the host
+## // Protocol Requirements
 
-## Usage
+*   `sudo` / root access (Admin Level Connection).
+*   Python 3.6+ (Wired Language Interface v3.6 or higher).
+*   Hardware Compatibility (Check the script's `header.txt` // the comments at the top). Needs specific AMD/NVIDIA setup.
 
-### Setup VFIO
+## // Initiate Connection
 
-```bash
-sudo python3 vfio.py
-```
-
-### Dry Run (Check Only)
+It's simple. Just... reach out.
 
 ```bash
-sudo python3 vfio.py --dry-run
+sudo python3 vfio-lain.py
 ```
 
-### Cleanup (Revert All Changes)
-
-```bash
-sudo python3 vfio.py --cleanup
-```
-
-## How It Works
-
-1. The script first gathers all relevant information about your system
-2. It displays a summary of what you have and what's missing
-3. You can choose which components to configure
-4. A cleanup script is created automatically to revert all changes
-
-## BTRFS Support
-
-If your system uses the BTRFS filesystem, the script will recommend creating a snapshot before making any changes. This provides an additional safety measure for reverting changes.
-
-## Notes
-
-- A system reboot is required after setup for changes to take effect
-- You can verify the setup after reboot using `lspci -nnk | grep -A3 'VGA\|Display'`
-- Use virt-manager to create a VM with the passed-through GPU
+// Connection Parameters
+--dry-run ➡️ Simulate the connection. No real changes made. Safe~ ☆
+--cleanup ➡️ Disconnect. Runs the generated vfio_cleanup.sh if it exists.
+--debug ➡️ Show all the hidden signals. Can be noisy.
+// Signal Interference ⚠️
+Modifying system connections can be strange. Unexpected results may occur. This script tries to be careful (backups, cleanup script), but the Wired is complex. Use --dry-run first. Understand what you are doing.
+...No matter where you go, everyone's connected.
