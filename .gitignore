@@ -1,0 +1,50 @@
+# Python bytecode files
+__pycache__/
+vfio_configurator/__pycache__
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Project specific
+.env
+
+# VFIO specific auto-generated files
+vfio_cleanup.sh
+vfio_changes.json
+*_backup_*
+**/vfio_backup_*
+**/pre_vfio_setup_*
+# Backup files created by the script
+*.bak

@@ -281,6 +281,8 @@ def parse_args():
                         help='Attempt non-interactive setup (assume "yes" to prompts). Use with caution.')
     parser.add_argument('--verify', action='store_true',
                         help='Show verification steps to perform after reboot.')
+    parser.add_argument('--verify-auto', action='store_true',
+                        help='Run automated verification checks with interactive fixing of failed steps.')
     
     args = parser.parse_args()
     
@@ -319,7 +321,7 @@ def main():
     print(f"{Colors.BOLD}{'=' * 80}{Colors.ENDC}")
     mode_str = ""
     if args.cleanup: mode_str += "[CLEANUP MODE] "
-    if args.verify: mode_str += "[VERIFY MODE] "
+    if args.verify or args.verify_auto: mode_str += "[VERIFY MODE] "
     if args.dry_run: mode_str += "[DRY RUN MODE] "
     print(f"{Colors.BOLD}{f'VFIO GPU Passthrough Setup {mode_str}'.strip():^80}{Colors.ENDC}")
     print(f"{Colors.BOLD}{'=' * 80}{Colors.ENDC}")
@@ -341,8 +343,12 @@ def main():
         return 1
         
     # --- Verification Mode ---
-    if args.verify:
-        verify_after_reboot(args.debug)
+    if args.verify or args.verify_auto:
+        if args.verify_auto:
+            log_info("Running automated verification checks...")
+            verify_after_reboot(args.debug, interactive=True)
+        else:
+            verify_after_reboot(args.debug, interactive=False)
         return 0
         
     # --- Cleanup Mode ---
@@ -435,6 +441,7 @@ def main():
             if made_critical_changes:
                 log_warning("A system REBOOT is required for changes to take effect.")
                 log_info("After rebooting, run with --verify to see verification steps.")
+                log_info("Or use --verify-auto for interactive verification with automatic fix options.")
 
         return 0  # Success
     else:
