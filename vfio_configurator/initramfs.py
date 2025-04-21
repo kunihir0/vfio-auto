@@ -47,46 +47,88 @@ def update_initramfs(dry_run: bool = False, debug: bool = False) -> bool:
     else:
         log_debug(f"Skipping vfio_virqfd as kernel {kernel_version} has this integrated into vfio module", debug)
     
-    # Try updating each system that was found
+    # Check if we're on an Arch-based system
+    distro_info = get_distro_info()
+    distro_name = distro_info.get('id', '').lower() if distro_info else ''
+    is_arch_based = distro_name in ['arch', 'manjaro', 'endeavouros', 'garuda'] or os.path.exists("/etc/arch-release")
+    
+    # Try to determine the default initramfs system for this distribution
+    default_system = detect_default_initramfs_system(distro_name, systems, debug)
+    if default_system:
+        log_info(f"Detected default initramfs system for this distribution: {default_system}")
+    
+    # Try updating each system that was found, prioritizing the default system
     success = False
     
-    # Try to update each detected system
-    if 'mkinitcpio' in systems:
+    # Try the default system first if we detected one
+    if default_system and default_system in systems:
+        log_info(f"Trying default initramfs system: {default_system}")
+        if default_system == 'mkinitcpio':
+            if ensure_mkinitcpio_modules(vfio_modules, debug):
+                if update_mkinitcpio(dry_run, debug):
+                    success = True
+                    return success
+        elif default_system == 'dracut':
+            if ensure_dracut_modules(vfio_modules, debug):
+                if update_dracut_custom(dry_run, debug, is_arch_based):
+                    success = True
+                    return success
+        elif default_system == 'booster':
+            if ensure_booster_modules(vfio_modules, debug):
+                if update_booster(dry_run, debug):
+                    success = True
+                    return success
+        elif default_system == 'debian':
+            if ensure_initramfs_modules_debian(vfio_modules, debug):
+                if update_initramfs_debian_based(dry_run, debug):
+                    success = True
+                    return success
+    
+    # If default system not found or failed, try distribution-specific approach
+    if not success:
+        if is_arch_based:
+            # For Arch-based systems
+            if 'mkinitcpio' in systems:
+                if ensure_mkinitcpio_modules(vfio_modules, debug):
+                    if update_mkinitcpio(dry_run, debug):
+                        success = True
+                        return success
+            if 'dracut' in systems:
+                if ensure_dracut_modules(vfio_modules, debug):
+                    if update_dracut_custom(dry_run, debug, is_arch_based):
+                        success = True
+                        return success
+        elif distro_name in ['ubuntu', 'debian', 'pop', 'linuxmint', 'elementary'] and 'debian' in systems:
+            if ensure_initramfs_modules_debian(vfio_modules, debug):
+                if update_initramfs_debian_based(dry_run, debug):
+                    success = True
+                    return success
+        elif distro_name in ['fedora', 'rhel', 'centos', 'rocky', 'alma'] and 'dracut' in systems:
+            if ensure_dracut_modules(vfio_modules, debug):
+                if update_initramfs_fedora_based(dry_run, debug):
+                    success = True
+                    return success
+    
+    # Standard priority order for other systems or if distribution-specific approach failed
+    if 'mkinitcpio' in systems and not success:
         if ensure_mkinitcpio_modules(vfio_modules, debug):
             if update_mkinitcpio(dry_run, debug):
                 success = True
     
-    if 'dracut' in systems:
+    if 'dracut' in systems and not success:
         if ensure_dracut_modules(vfio_modules, debug):
-            if update_dracut(dry_run, debug):
+            if update_dracut_custom(dry_run, debug, is_arch_based):
                 success = True
     
-    if 'booster' in systems:
+    if 'booster' in systems and not success:
         if ensure_booster_modules(vfio_modules, debug):
             if update_booster(dry_run, debug):
                 success = True
                 
-    if 'debian' in systems:
+    if 'debian' in systems and not success:
         if ensure_initramfs_modules_debian(vfio_modules, debug):
             if update_initramfs_debian_based(dry_run, debug):
                 success = True
-    
-    # If no specific system updated successfully but we know the distro, try distro-specific approach
-    if not success:
-        # Detect the distribution as backup approach
-        distro_info = get_distro_info()
-        distro_name = distro_info.get('id', '').lower() if distro_info else ''
-        
-        if distro_name:
-            log_info(f"Trying distribution-specific approach for {distro_name}...")
-            if distro_name in ['ubuntu', 'debian', 'pop', 'linuxmint', 'elementary']:
-                success = update_initramfs_debian_based(dry_run, debug)
-            elif distro_name in ['fedora', 'rhel', 'centos', 'rocky', 'alma']:
-                success = update_initramfs_fedora_based(dry_run, debug)
-            elif distro_name in ['arch', 'manjaro', 'endeavouros', 'garuda']:
-                success = update_initramfs_arch_based(dry_run, debug)
-            elif distro_name in ['opensuse', 'suse']:
-                success = update_initramfs_suse_based(dry_run, debug)
     
     # If still no success, try generic approach
     if not success:
@@ -131,6 +173,64 @@ def detect_initramfs_systems(debug: bool = False) -> Set[str]:
     return systems
 
 
+def detect_default_initramfs_system(distro_name: str, detected_systems: Set[str], debug: bool = False) -> Optional[str]:
+    """
+    Detect the default initramfs system for a given distribution.
+    
+    Args:
+        distro_name: The distribution name, lowercase
+        detected_systems: Set of detected initramfs systems
+        debug: Enable debug output
+        
+    Returns:
+        String with default system name or None if unknown
+    """
+    # Check for systemd-boot or dracut symlinks in /usr/lib/kernel
+    is_dracut_default = (
+        os.path.exists("/usr/lib/dracut/dracut.conf.d") or
+        os.path.exists("/usr/lib/kernel/install.d/50-dracut.install")
+    )
+    
+    is_mkinitcpio_default = (
+        os.path.exists("/usr/lib/kernel/install.d/50-mkinitcpio.install") or
+        os.path.exists("/usr/share/libalpm/hooks/60-mkinitcpio-remove.hook")
+    )
+    
+    is_booster_default = (
+        os.path.exists("/usr/lib/kernel/install.d/50-booster.install") or
+        os.path.exists("/usr/lib/booster")
+    )
+    
+    # Specific distribution checks
+    if distro_name in ['arch', 'manjaro']:
+        return 'mkinitcpio' if 'mkinitcpio' in detected_systems else None
+    elif distro_name in ['garuda', 'endeavouros']:
+        if 'dracut' in detected_systems:
+            return 'dracut'
+        elif 'mkinitcpio' in detected_systems:
+            return 'mkinitcpio'
+    elif distro_name in ['fedora', 'centos', 'rhel', 'rocky', 'alma']:
+        return 'dracut' if 'dracut' in detected_systems else None
+    elif distro_name in ['ubuntu', 'debian', 'pop', 'linuxmint', 'elementary']:
+        return 'debian' if 'debian' in detected_systems else None
+    elif distro_name in ['opensuse', 'suse']:
+        return 'dracut' if 'dracut' in detected_systems else None
+    
+    # If no specific distro match, use file-based detection
+    if is_dracut_default and 'dracut' in detected_systems:
+        return 'dracut'
+    elif is_mkinitcpio_default and 'mkinitcpio' in detected_systems:
+        return 'mkinitcpio'
+    elif is_booster_default and 'booster' in detected_systems:
+        return 'booster'
+    
+    # As a last resort, if only one system is detected, use that
+    if len(detected_systems) == 1:
+        return list(detected_systems)[0]
+    
+    return None
+
+
 def update_mkinitcpio(dry_run: bool = False, debug: bool = False) -> bool:
     """
     Update initramfs using mkinitcpio.
@@ -153,26 +253,65 @@ def update_mkinitcpio(dry_run: bool = False, debug: bool = False) -> bool:
         return False
 
 
-def update_dracut(dry_run: bool = False, debug: bool = False) -> bool:
+def update_dracut_custom(dry_run: bool = False, debug: bool = False, is_arch_based: bool = False) -> bool:
     """
-    Update initramfs using dracut.
+    Update initramfs using dracut with custom handling for different systems.
     
+    Args:
+        dry_run: If True, simulate operations without making changes.
+        debug: If True, print debug messages.
+        is_arch_based: If True, use Arch-specific dracut commands.
+        
     Returns:
         True if successful, False otherwise.
     """
-    cmd = "dracut --force"
-    log_info(f"Running: {cmd}")
-    if dry_run:
-        log_info("Dry run enabled, not executing command.")
-        return True
-    output = run_command(cmd, debug=debug)
-    
-    if output is not None:
-        log_success("Successfully updated initramfs with dracut.")
-        return True
+    if is_arch_based:
+        # For Arch-based systems, we need to specify the output path
+        try:
+            # Try to determine the kernel version
+            kernel_ver = run_command("uname -r", debug=debug)
+            if kernel_ver:
+                kernel_ver = kernel_ver.strip()
+                
+                # Create the target path for initramfs
+                initramfs_dir = "/boot"
+                os.makedirs(initramfs_dir, exist_ok=True)
+                
+                # On some systems like Garuda we need to use a specific output path
+                cmd = f"dracut -f /boot/initramfs-{kernel_ver}.img {kernel_ver}"
+                log_info(f"Running: {cmd}")
+                if dry_run:
+                    log_info("Dry run enabled, not executing command.")
+                    return True
+                output = run_command(cmd, debug=debug)
+                
+                if output is not None:
+                    log_success("Successfully updated initramfs with dracut.")
+                    return True
+                else:
+                    log_error("Failed to update initramfs with dracut.")
+                    return False
+            else:
+                log_error("Failed to determine kernel version for dracut.")
+                return False
+        except Exception as e:
+            log_error(f"Error during dracut invocation: {e}")
+            return False
     else:
-        log_error("Failed to update initramfs with dracut.")
-        return False
+        # Standard dracut command for non-Arch systems
+        cmd = "dracut --force"
+        log_info(f"Running: {cmd}")
+        if dry_run:
+            log_info("Dry run enabled, not executing command.")
+            return True
+        output = run_command(cmd, debug=debug)
+        
+        if output is not None:
+            log_success("Successfully updated initramfs with dracut.")
+            return True
+        else:
+            log_error("Failed to update initramfs with dracut.")
+            return False
 
 
 def update_booster(dry_run: bool = False, debug: bool = False) -> bool:
@@ -425,36 +564,107 @@ def update_initramfs_arch_based(dry_run: bool = False, debug: bool = False) -> b
     Returns:
         True if successful, False otherwise.
     """
-    # Check if mkinitcpio exists
+    # First check for mkinitcpio - the preferred tool for Arch-based systems
     mkinitcpio_bin = shutil.which('mkinitcpio')
     if not mkinitcpio_bin:
-        log_error("mkinitcpio not found. Is it installed?")
+        log_error("mkinitcpio not found. You may need to manually install it.")
         return False
     
-    # Get kernel version to check if vfio_virqfd is needed
+    # Get list of modules to add
     kernel_version = get_kernel_version()
     modules_to_add = ['vfio', 'vfio_iommu_type1', 'vfio_pci']
     if kernel_version and (kernel_version[0] < 6 or (kernel_version[0] == 6 and kernel_version[1] < 2)):
         modules_to_add.append('vfio_virqfd')
     
-    # Ensure the appropriate modules are in the mkinitcpio.conf
-    if not ensure_mkinitcpio_modules(modules_to_add, debug):
-        return False
+    success = False
     
-    # Regenerate all initramfs images
-    cmd = "mkinitcpio -P"
-    log_info(f"Running: {cmd}")
-    if dry_run:
-        log_info("Dry run enabled, not executing command.")
-        return True
-    output = run_command(cmd, debug=debug)
+    # Try mkinitcpio if available
+    if mkinitcpio_bin:
+        # Ensure modules are in mkinitcpio.conf
+        if ensure_mkinitcpio_modules(modules_to_add, debug):
+            # First try the standard command
+            cmd = "mkinitcpio -P"
+            log_info(f"Running: {cmd}")
+            if dry_run:
+                log_info("Dry run enabled, not executing command.")
+                return True
+            
+            output = run_command(cmd, debug=debug)
+            if output is not None:
+                log_success("Successfully updated initramfs with mkinitcpio.")
+                return True
+            else:
+                # If standard approach fails, try a workaround for Garuda/other Arch derivatives
+                log_warning("Standard mkinitcpio command failed, trying alternative approach...")
+                
+                # Get list of installed kernels
+                kernel_cmd = "ls /usr/lib/modules/"
+                kernel_list = run_command(kernel_cmd, debug=debug)
+                if kernel_list:
+                    kernels = kernel_list.strip().split('\n')
+                    for kernel in kernels:
+                        if os.path.isdir(f"/usr/lib/modules/{kernel}"):
+                            # Try to build initramfs for each kernel specifically
+                            cmd = f"mkinitcpio -p {kernel}"
+                            log_info(f"Building initramfs for kernel: {kernel}")
+                            output = run_command(cmd, debug=debug)
+                            if output is not None:
+                                log_success(f"Successfully built initramfs for kernel: {kernel}")
+                                success = True
+                    
+                    if success:
+                        log_success("Successfully updated initramfs for all available kernels.")
+                        return True
+                    else:
+                        log_error("Failed to update initramfs for any kernel.")
+                        return False
+                else:
+                    log_error("Failed to list available kernels.")
+                    return False
     
-    if output is not None:
-        log_success("Successfully updated initramfs.")
-        return True
-    else:
-        log_error("Failed to update initramfs.")
-        return False
+    # If mkinitcpio failed or isn't available, check for dracut as a fallback on Arch
+    dracut_bin = shutil.which('dracut')
+    if dracut_bin and not success:
+        log_info("Attempting to use dracut as fallback on Arch-based system")
+        # Configure dracut to include VFIO modules
+        if ensure_dracut_modules(modules_to_add, debug):
+            # Try to use dracut in a more Arch-friendly way
+            try:
+                # Try to determine the kernel version
+                kernel_ver = run_command("uname -r", debug=debug)
+                if kernel_ver:
+                    kernel_ver = kernel_ver.strip()
+                    
+                    # Create the target path for initramfs
+                    initramfs_dir = "/boot"
+                    os.makedirs(initramfs_dir, exist_ok=True)
+                    
+                    # On some systems like Garuda we need to use a specific output path
+                    cmd = f"dracut -f /boot/initramfs-{kernel_ver}.img {kernel_ver}"
+                    log_info(f"Running: {cmd}")
+                    if dry_run:
+                        log_info("Dry run enabled, not executing command.")
+                        return True
+                    output = run_command(cmd, debug=debug)
+                    
+                    if output is not None:
+                        log_success("Successfully updated initramfs with dracut.")
+                        return True
+                    else:
+                        log_error("Failed to update initramfs with dracut.")
+                        return False
+                else:
+                    log_error("Failed to determine kernel version for dracut.")
+                    return False
+            except Exception as e:
+                log_error(f"Error during dracut fallback: {e}")
+                return False
+    
+    # All methods failed
+    log_error("Failed to update initramfs on Arch-based system. Neither mkinitcpio nor dracut worked.")
+    log_error("You may need to manually update your initramfs to include VFIO modules.")
+    log_error("For reference, you should ensure these modules are included: " + ", ".join(modules_to_add))
+    return False
 
 
 def ensure_mkinitcpio_modules(modules: List[str], debug: bool = False) -> bool:
