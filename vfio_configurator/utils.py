@@ -179,13 +179,14 @@ def run_command(command: str, dry_run: bool = False, debug: bool = False) -> Opt
         return None
 
 
-def create_timestamped_backup(file_path_str: str, dry_run: bool = False, debug: bool = False) -> Optional[str]:
+def create_timestamped_backup(file_path_str: str, dry_run: bool = False, debug: bool = False, output_dir: str = None) -> Optional[str]:
     """Create a timestamped backup of a file.
     
     Args:
         file_path_str: Path to the file to back up
         dry_run: If True, don't actually create the backup
         debug: If True, print additional debug information
+        output_dir: Directory to store backups (if None, use project root directory)
         
     Returns:
         Path to the backup file or None if backup wasn't needed/created
@@ -196,8 +197,28 @@ def create_timestamped_backup(file_path_str: str, dry_run: bool = False, debug: 
         return None
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    # Place backup in the same directory as the original file
-    backup_path = file_path.with_suffix(f"{file_path.suffix}.vfio_bak.{timestamp}")
+    
+    # Determine backup directory - use output_dir if provided
+    if output_dir:
+        backup_dir = Path(output_dir) / "backups"
+    else:
+        # Use script directory or current directory as fallback
+        script_dir = get_script_dir()
+        backup_dir = Path(script_dir) / "backups"
+    
+    # Create backups directory if it doesn't exist
+    if not dry_run:
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            log_error(f"Could not create backups directory {backup_dir}: {e}")
+            return None
+    
+    # Create a safe filename from the original path to avoid conflicts
+    # Convert absolute path to a structure that preserves directories but is safe as a filename
+    rel_path = str(file_path).replace('/', '_').replace('\\', '_').lstrip('_')
+    backup_filename = f"{rel_path}.vfio_bak.{timestamp}"
+    backup_path = backup_dir / backup_filename
     backup_path_str = str(backup_path)
 
     if dry_run:
@@ -214,19 +235,20 @@ def create_timestamped_backup(file_path_str: str, dry_run: bool = False, debug: 
         return None
 
 
-def backup_file(file_path: str, dry_run: bool = False, debug: bool = False) -> Optional[str]:
+def backup_file(file_path: str, dry_run: bool = False, debug: bool = False, output_dir: str = None) -> Optional[str]:
     """Create a backup of a file.
     
     Args:
         file_path: Path to the file to back up
         dry_run: If True, don't actually create the backup
         debug: If True, print additional debug information
+        output_dir: Directory to store backups (if None, use project root directory)
         
     Returns:
         Path to the backup file or None if backup wasn't created
     """
     # This is a wrapper around create_timestamped_backup for backward compatibility
-    return create_timestamped_backup(file_path, dry_run, debug)
+    return create_timestamped_backup(file_path, dry_run, debug, output_dir)
 
 
 def get_script_dir() -> str:

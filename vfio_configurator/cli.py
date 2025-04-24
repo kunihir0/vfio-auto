@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 
 from vfio_configurator.snapshot import create_btrfs_snapshot_recommendation, check_btrfs
 from vfio_configurator.reporting import display_system_summary, verify_after_reboot, display_config_changes_summary
+from vfio_configurator.packages import setup_minimal_qemu_environment, is_arch_based
 
 from .utils import (
     Colors, log_info, log_success, log_warning, log_error, log_debug,
@@ -164,21 +165,33 @@ def interactive_setup(output_dir: str, system_info: Dict[str, Any], non_interact
              response = input("Configure kernel parameters for IOMMU and VFIO? (y/n): ").lower()
 
         if response == 'y':
-            kernel_param_result = configure_kernel_parameters(dry_run, debug)
+            kernel_param_result = configure_kernel_parameters(dry_run, debug, output_dir)
             if kernel_param_result and kernel_param_result.get("status"):
                 log_success("Kernel parameter configuration completed successfully.")
                 made_critical_changes = True
                 
-                # Track changes for grub/kernelstub
+                # Track changes for grub/kernelstub/systemd-boot
                 method = kernel_param_result.get("method")
                 if method == "grub" and kernel_param_result.get("backup_path"):
                     changes = track_change(
-                        changes, "files", "/etc/default/grub", "modified", 
+                        changes, "files", "/etc/default/grub", "modified",
                         {"backup_path": kernel_param_result.get("backup_path")}
                     )
                 elif method == "kernelstub":
                     for param in kernel_param_result.get("added_params", []):
                         changes = track_change(changes, "kernelstub", param, "added")
+                elif method == "systemd-boot" and kernel_param_result.get("backup_paths"):
+                    # Track all modified systemd-boot entries with specific category
+                    for file_path, backup_path in kernel_param_result.get("backup_paths", {}).items():
+                        changes = track_change(
+                            changes, "systemd-boot", file_path, "modified",
+                            {"backup_path": backup_path, "params": kernel_param_result.get("added_params", [])}
+                        )
+                    # Also add a record of the bootloader type for the cleanup script
+                    changes = track_change(
+                        changes, "bootloader", "type", "info",
+                        {"value": "systemd-boot"}
+                    )
             else:
                 log_error("Kernel parameter configuration failed.")
                 setup_successful = False
@@ -245,18 +258,50 @@ def interactive_setup(output_dir: str, system_info: Dict[str, Any], non_interact
     if not system_info["libvirt_installed"]:
         print(f"\n{Colors.BOLD}Virtualization Software Installation{Colors.ENDC}")
         log_info("Virtualization software (QEMU, Libvirt, etc.) seems missing or incomplete.")
-        response = 'y'
-        if not non_interactive and not dry_run:
-             response = input("Would you like to install virtualization software now? (y/n): ").lower()
+        
+        # Check if system is Arch-based
+        arch_system = is_arch_based()
+        if arch_system:
+            response = 'y'
+            if not non_interactive and not dry_run:
+                response = input("Would you like to install minimal QEMU environment for Arch Linux now? (y/n): ").lower()
 
-        if response == 'y':
-            log_info("Please install virtualization software manually using your package manager.")
-            log_info("Refer to the distribution-specific suggestions shown earlier.")
-            # Note: We don't attempt to install packages directly from this script
-            # as package manager commands vary across distributions
+            if response == 'y':
+                log_info("Installing minimal QEMU environment for VFIO passthrough (Arch Linux)...")
+                
+                # Run the setup function from the packages module
+                setup_result = setup_minimal_qemu_environment(None, dry_run, debug)
+                
+                if setup_result["status"]:
+                    log_success("Minimal QEMU environment installed successfully.")
+                    if setup_result["installed_packages"]:
+                        log_info(f"Installed packages: {', '.join(setup_result['installed_packages'])}")
+                    
+                    changes = track_change(changes, "packages", "qemu-minimal", "installed",
+                                           {"installed_packages": setup_result["installed_packages"]})
+                else:
+                    log_error("Failed to install minimal QEMU environment.")
+                    if setup_result["failed_packages"]:
+                        log_error(f"Failed packages: {', '.join(setup_result['failed_packages'])}")
+                    setup_successful = False
+            else:
+                log_warning("QEMU environment installation skipped by user choice.")
+                log_warning("You will need to install virtualization software manually to use the passthrough GPU.")
         else:
-             log_warning("Virtualization software installation skipped by user choice.")
-             log_warning("You will need to install this software manually to use the passthrough GPU.")
+            # For non-Arch systems, provide manual instructions
+            response = 'y'
+            if not non_interactive and not dry_run:
+                response = input("Would you like to install virtualization software now? (y/n): ").lower()
+
+            if response == 'y':
+                log_info("Please install virtualization software manually using your package manager.")
+                log_info("Refer to the distribution-specific suggestions shown earlier.")
+                log_info("For Debian/Ubuntu: sudo apt install qemu-kvm libvirt-daemon-system virt-manager")
+                log_info("For Fedora: sudo dnf install qemu-kvm libvirt virt-manager")
+                log_info("For openSUSE: sudo zypper install qemu-kvm libvirt virt-manager")
+            else:
+                log_warning("Virtualization software installation skipped by user choice.")
+                log_warning("You will need to install this software manually to use the passthrough GPU.")
 
     # --- Final Outcome ---
     return setup_successful, changes, made_critical_changes

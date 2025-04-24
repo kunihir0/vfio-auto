@@ -86,7 +86,7 @@ def get_grub_cmdline_params(grub_default_path: Path, debug: bool = False) -> str
         return "quiet splash"
 
 
-def modify_grub_default(params_to_add: List[str], dry_run: bool = False, debug: bool = False) -> Tuple[bool, Optional[str]]:
+def modify_grub_default(params_to_add: List[str], dry_run: bool = False, debug: bool = False, output_dir: str = None) -> Tuple[bool, Optional[str]]:
     """
     Modify GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub to add kernel parameters.
 
@@ -94,6 +94,7 @@ def modify_grub_default(params_to_add: List[str], dry_run: bool = False, debug: 
         params_to_add: List of kernel parameters to add
         dry_run: If True, don't actually modify files
         debug: If True, print additional debug information
+        output_dir: Directory to store backups
 
     Returns:
         Tuple[bool, Optional[str]]: (success_status, backup_path)
@@ -108,7 +109,7 @@ def modify_grub_default(params_to_add: List[str], dry_run: bool = False, debug: 
         return False, None
 
     # Create backup before modification
-    backup_path = create_timestamped_backup(str(grub_default_path), dry_run, debug)
+    backup_path = create_timestamped_backup(str(grub_default_path), dry_run, debug, output_dir)
     if not backup_path and not dry_run and grub_default_path.exists():  # Check exists again in case of race
         log_error(f"Failed to create backup of {grub_default_path}. Aborting GRUB modification.")
         return False, None
@@ -349,13 +350,189 @@ def configure_kernel_parameters_popos(params_to_add: List[str], dry_run: bool = 
     return added_params_successfully  # Return only the parameters that were newly added/updated
 
 
-def configure_kernel_parameters(dry_run: bool = False, debug: bool = False) -> Optional[Dict[str, Any]]:
+def modify_systemd_boot_entries(params_to_add: List[str], dry_run: bool = False, debug: bool = False, output_dir: str = None) -> Tuple[bool, Dict[str, str], List[str]]:
+    """
+    Modify systemd-boot entry files to add kernel parameters.
+    
+    Args:
+        params_to_add: List of kernel parameters to add
+        dry_run: If True, don't actually modify files
+        debug: If True, print additional debug information
+        output_dir: Directory to store backups
+    
+    Returns:
+        Tuple[bool, Dict[str, str], List[str]]: (success_status, backup_paths_dict, added_params_list)
+    """
+    log_info("Configuring kernel parameters for systemd-boot...")
+    
+    # Look in multiple potential locations for systemd-boot entries
+    possible_entry_dirs = [
+        Path('/boot/loader/entries'),         # Standard location
+        Path('/boot/efi/loader/entries'),     # Alternative EFI location
+        Path('/efi/loader/entries')           # Another potential location
+    ]
+    
+    entries_dir = None
+    for dir_path in possible_entry_dirs:
+        if dir_path.exists() and dir_path.is_dir():
+            entries_dir = dir_path
+            log_debug(f"Found systemd-boot entries at {entries_dir}", debug)
+            break
+    
+    if not entries_dir:
+        log_error(f"systemd-boot entries directory not found in any standard location")
+        return False, {}, []
+    
+    # Find all .conf files but exclude fallback entries
+    all_conf_files = list(entries_dir.glob('*.conf'))
+    entry_files = []
+    for file in all_conf_files:
+        if 'fallback' not in file.name:
+            entry_files.append(file)
+            
+    if not entry_files:
+        log_error(f"No suitable systemd-boot entry files found in {entries_dir}")
+        return False, {}, []
+        
+    log_info(f"Found {len(entry_files)} suitable boot entries to modify")
+    
+    backup_paths: Dict[str, str] = {}
+    modified_files = 0
+    added_params = []
+    
+    # Check if bootctl is available for potential verification
+    bootctl_available = shutil.which('bootctl') is not None
+    if bootctl_available and debug:
+        log_debug("bootctl command is available for systemd-boot operations", debug)
+    
+    for entry_file in entry_files:
+        log_info(f"Processing systemd-boot entry: {entry_file.name}")
+        
+        # Create backup before modification
+        backup_path = create_timestamped_backup(str(entry_file), dry_run, debug, output_dir)
+        if not backup_path and not dry_run:
+            log_error(f"Failed to create backup of {entry_file}. Skipping.")
+            continue
+            
+        backup_paths[str(entry_file)] = backup_path
+        
+        try:
+            # Read the file content
+            content = entry_file.read_text().splitlines()
+            
+            # Find the options line - handle commented lines and variations
+            options_line_idx = None
+            options_line = None
+            for i, line in enumerate(content):
+                line_stripped = line.strip()
+                if line_stripped.startswith('#'):
+                    continue  # Skip commented lines
+                    
+                if line_stripped.startswith('options '):
+                    options_line_idx = i
+                    options_line = line
+                    break
+            
+            # Handle case where options line doesn't exist
+            if options_line is None:
+                log_warning(f"No 'options' line found in {entry_file}")
+                # Try to append options line if file has content
+                if content:
+                    if not dry_run:
+                        options_line = f"options {' '.join(params_to_add)}"
+                        content.append(options_line)
+                        entry_file.write_text('\n'.join(content) + '\n')
+                        log_success(f"Added new options line to {entry_file}")
+                        modified_files += 1
+                        added_params = params_to_add
+                    else:
+                        log_debug(f"[DRY RUN] Would add new options line to {entry_file}: \"options {' '.join(params_to_add)}\"", debug)
+                        added_params = params_to_add  # Assume all added in dry run
+                else:
+                    log_error(f"File {entry_file} appears to be empty. Skipping.")
+                    continue
+            else:
+                # Extract the current parameters
+                current_params_str = options_line.replace('options ', '', 1).strip()
+                current_params = set(current_params_str.split())
+                new_params_to_add_set = set(params_to_add)
+                
+                # Handle parameter replacement logic (similar to GRUB function)
+                param_prefixes_to_replace = {p.split('=')[0] for p in params_to_add if '=' in p} | \
+                                           {p for p in params_to_add if '=' not in p}
+                
+                filtered_current_params = set()
+                removed_params = set()
+                for p in current_params:
+                    p_key = p.split('=')[0] if '=' in p else p
+                    if p_key in param_prefixes_to_replace or p in param_prefixes_to_replace:
+                        removed_params.add(p)
+                    else:
+                        filtered_current_params.add(p)
+                
+                if removed_params and debug:
+                    log_debug(f"Removing conflicting params: {', '.join(sorted(list(removed_params)))}", debug)
+                
+                # Combine filtered existing params with the new ones
+                final_params_set = filtered_current_params.union(new_params_to_add_set)
+                final_params_str = " ".join(sorted(list(final_params_set)))
+                
+                # Construct the new options line
+                new_options_line = f"options {final_params_str}"
+                
+                if new_options_line != options_line:
+                    if dry_run:
+                        log_debug(f"[DRY RUN] Would modify {entry_file}:", debug)
+                        log_debug(f"[DRY RUN]   Current options: \"{current_params_str}\"", debug)
+                        log_debug(f"[DRY RUN]   New options: \"{final_params_str}\"", debug)
+                        added_params = params_to_add  # Assume all added in dry run
+                    else:
+                        # Update the options line
+                        content[options_line_idx] = new_options_line
+                        
+                        # Write the updated content back
+                        entry_file.write_text('\n'.join(content) + '\n')
+                        
+                        log_success(f"Successfully updated {entry_file} with new kernel parameters")
+                        modified_files += 1
+                        added_params = params_to_add
+                else:
+                    log_info(f"No changes needed for {entry_file} - parameters already present")
+        
+        except Exception as e:
+            log_error(f"Failed to modify {entry_file}: {e}")
+            # Attempt to restore backup
+            if not dry_run and backup_path and Path(backup_path).exists():
+                try:
+                    shutil.move(backup_path, str(entry_file))
+                    log_info(f"Restored backup of {entry_file} from {backup_path}")
+                except Exception as restore_e:
+                    log_error(f"Failed to restore backup {backup_path}: {restore_e}")
+    
+    success = modified_files > 0 or dry_run
+    if success:
+        log_success(f"systemd-boot kernel parameters configured successfully")
+        
+        # Use bootctl to list entries if available (for verification purposes)
+        if bootctl_available and debug and not dry_run:
+            log_debug("Verifying systemd-boot entries with bootctl:", debug)
+            bootctl_output = run_command("bootctl list", dry_run=False, debug=debug)
+            if bootctl_output:
+                log_debug(f"bootctl verification output:\n{bootctl_output}", debug)
+    else:
+        log_error(f"Failed to update any systemd-boot entries")
+    
+    return success, backup_paths, added_params
+
+
+def configure_kernel_parameters(dry_run: bool = False, debug: bool = False, output_dir: str = None) -> Optional[Dict[str, Any]]:
     """
     Configure kernel parameters for IOMMU and VFIO using the appropriate method.
 
     Args:
         dry_run: If True, don't actually modify kernel parameters
         debug: If True, print additional debug information
+        output_dir: Directory to store backups
 
     Returns:
         A dictionary containing info about the operation, e.g.,
@@ -380,7 +557,7 @@ def configure_kernel_parameters(dry_run: bool = False, debug: bool = False) -> O
     if "grub" in bootloader:
         log_info("Using GRUB configuration method")
         result_info['method'] = 'grub'
-        success, backup_path = modify_grub_default(required_params, dry_run, debug)
+        success, backup_path = modify_grub_default(required_params, dry_run, debug, output_dir)
         result_info['status'] = success
         result_info['backup_path'] = backup_path
         
@@ -427,6 +604,15 @@ def configure_kernel_parameters(dry_run: bool = False, debug: bool = False) -> O
         result_info['status'] = bool(added_params) or all(p in added_params for p in required_params)
         result_info['added_params'] = added_params
         
+    # --- systemd-boot (standard) ---
+    elif bootloader == "systemd-boot":
+        log_info("Using standard systemd-boot configuration method")
+        result_info['method'] = 'systemd-boot'
+        success, backup_paths, added_params = modify_systemd_boot_entries(required_params, dry_run, debug, output_dir)
+        result_info['status'] = success
+        result_info['backup_paths'] = backup_paths  # Dictionary of file paths and their backups
+        result_info['added_params'] = added_params
+    
     else:
         log_warning(f"Unsupported bootloader: {bootloader}")
         log_warning("You will need to manually add these kernel parameters:")

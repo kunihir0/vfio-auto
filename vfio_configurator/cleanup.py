@@ -332,8 +332,8 @@ def _generate_file_restoration(file_changes: List[Dict[str, Any]]) -> List[str]:
 
 
 def _generate_kernel_param_restoration(
-    kernelstub_changes: List[Dict[str, Any]], 
-    file_changes: List[Dict[str, Any]], 
+    kernelstub_changes: List[Dict[str, Any]],
+    file_changes: List[Dict[str, Any]],
     distro_info: Dict[str, Any]
 ) -> Tuple[List[str], List[str], bool]:
     """Generate script content for restoring kernel parameters.
@@ -347,6 +347,8 @@ def _generate_kernel_param_restoration(
     # Check if /etc/default/grub was modified for GRUB systems
     grub_modified = False
     grub_default_file = '/etc/default/grub'
+    
+    # Check for GRUB modifications
     for change in file_changes:
         if change.get('item') == grub_default_file and change.get('action') == 'modified':
             grub_modified = True
@@ -512,7 +514,10 @@ def _generate_bootloader_update(grub_modified: bool, distro_info: Dict[str, Any]
     """Generate script content for updating bootloader."""
     script_content = ["# --- Updating Bootloader Configuration ---"]
     
-    if not grub_modified and distro_info["bootloader"] != "systemd-boot-popos":
+    # We should always check for systemd-boot if that's the detected bootloader
+    systemd_boot_detected = distro_info["bootloader"] in ["systemd-boot", "systemd-boot-popos"]
+    
+    if not grub_modified and not systemd_boot_detected:
         script_content.extend([
             "log_info 'No bootloader configuration changes detected, skipping update.'",
             ""
@@ -566,6 +571,53 @@ def _generate_bootloader_update(grub_modified: bool, distro_info: Dict[str, Any]
     elif bootloader == "systemd-boot-popos" or bootloader == "systemd-boot":
         script_content.extend([
             "log_info 'Detected systemd-boot bootloader.'",
+            "",
+            "# Look for systemd-boot backups in both the conventional and project backup directories",
+            "PROJECT_ROOT=\"$(dirname \"$0\")\"",
+            "BACKUP_DIR=\"${PROJECT_ROOT}/backups\"",
+            "",
+            "# Restore systemd-boot entry files from backups if they exist",
+            "log_info 'Looking for systemd-boot entry backups to restore...'",
+            "",
+            "# First check in the project backup directory",
+            "if [ -d \"${BACKUP_DIR}\" ]; then",
+            "  log_info \"Checking for backups in ${BACKUP_DIR}\"",
+            "  # Look for files with pattern *boot_loader_entries*.vfio_bak.*",
+            "  for backup_file in \"${BACKUP_DIR}\"/*boot_loader_entries*.vfio_bak.*; do",
+            "    if [ -f \"$backup_file\" ] && [[ \"$backup_file\" != *\"fallback\"* ]]; then",
+            "      # Extract the original filename from backup filename",
+            "      original_filename=$(basename \"$backup_file\" | sed 's/.*_\\([^_]*\\.conf\\)\\.vfio_bak.*/\\1/')",
+            "      if [[ \"$original_filename\" == *.conf ]]; then",
+            "        # Try standard locations for systemd-boot entries",
+            "        for entry_dir in /boot/loader/entries /boot/efi/loader/entries /efi/loader/entries; do",
+            "          if [ -d \"$entry_dir\" ]; then",
+            "            entry_file=\"${entry_dir}/${original_filename}\"",
+            "            if [ -f \"$entry_file\" ]; then",
+            "              log_info \"Restoring systemd-boot entry from project backup: $backup_file -> $entry_file\"",
+            "              run_cmd cp -f \"$backup_file\" \"$entry_file\"",
+            "              break",
+            "            fi",
+            "          fi",
+            "        done",
+            "      fi",
+            "    fi",
+            "  done",
+            "fi",
+            "",
+            "# Also check for legacy-style backups next to the original files",
+            "log_info 'Checking for legacy backups next to original files'",
+            "for file_path in /boot/loader/entries/*.conf /boot/efi/loader/entries/*.conf; do",
+            "  if [ -f \"$file_path\" ] && [[ \"$file_path\" != *\"fallback\"* ]]; then",
+            "    backup_path=\"${file_path}.vfio_bak.*\"",
+            "    if ls $backup_path >/dev/null 2>&1; then",
+            "      newest_backup=$(ls -t $backup_path | head -1)",
+            "      log_info \"Restoring systemd-boot entry from legacy backup: $newest_backup -> $file_path\"",
+            "      run_cmd cp -f \"$newest_backup\" \"$file_path\"",
+            "    fi",
+            "  fi",
+            "done",
+            "",
+            "# Update systemd-boot configuration",
             "if command -v bootctl >/dev/null 2>&1; then",
             "  log_info 'Updating systemd-boot configuration...'",
             "  run_cmd bootctl update || log_warn 'bootctl update failed'",
