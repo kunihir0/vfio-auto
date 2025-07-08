@@ -1,0 +1,4 @@
+title   Arch OS
+linux   /vmlinuz-linux-zen
+initrd  /initramfs-linux-zen.img
+options init=/usr/lib/systemd/systemd nowatchdog root=PARTUUID=89adbad0-36a0-4bb6-a493-19fb7b906183 rw vt.global_cursor_default=0 zswap.enabled=0 plymouth.enable=0
