@@ -3,6 +3,8 @@ __pycache__/
 vfio_configurator/__pycache__
 *.py[cod]
 *$py.class
+.venv
+__init__
 
 # Distribution / packaging
 dist/
